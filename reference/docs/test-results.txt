@@ -1,0 +1,34 @@
+test_affect_bounded_and_decays (test_runtime.PureTests.test_affect_bounded_and_decays) ... ok
+test_affect_changes_marginal_behavior_but_not_hard_constraints (test_runtime.PureTests.test_affect_changes_marginal_behavior_but_not_hard_constraints) ... ok
+test_confidence_not_probability_of_correctness (test_runtime.PureTests.test_confidence_not_probability_of_correctness) ... ok
+test_rest_parser_rejects_choice_probability_mismatch (test_runtime.PureTests.test_rest_parser_rejects_choice_probability_mismatch) ... ok
+test_rest_parser_rejects_nan_and_bool (test_runtime.PureTests.test_rest_parser_rejects_nan_and_bool) ... ok
+test_rest_parser_requires_normalized_choice (test_runtime.PureTests.test_rest_parser_requires_normalized_choice) ... ok
+test_rest_parser_uses_noul_field (test_runtime.PureTests.test_rest_parser_uses_noul_field) ... ok
+test_ambiguous_delivery_remains_unknown_without_retry (test_runtime.RuntimeTests.test_ambiguous_delivery_remains_unknown_without_retry) ... ok
+test_changed_guards_discard_inflight_draft (test_runtime.RuntimeTests.test_changed_guards_discard_inflight_draft) ... ok
+test_cloud_denied_before_remote_call (test_runtime.RuntimeTests.test_cloud_denied_before_remote_call) ... ok
+test_cooldown (test_runtime.RuntimeTests.test_cooldown) ... ok
+test_current_observation_not_mistaken_for_previous_context (test_runtime.RuntimeTests.test_current_observation_not_mistaken_for_previous_context) ... ok
+test_direct_bypasses_proactive_gate_and_jev (test_runtime.RuntimeTests.test_direct_bypasses_proactive_gate_and_jev) ... ok
+test_duplicate_candidate_is_not_resent (test_runtime.RuntimeTests.test_duplicate_candidate_is_not_resent) ... ok
+test_duplicate_event_is_not_reappraised (test_runtime.RuntimeTests.test_duplicate_event_is_not_reappraised) ... ok
+test_event_cannot_claim_to_be_user (test_runtime.RuntimeTests.test_event_cannot_claim_to_be_user) ... ok
+test_event_during_draft_invalidates_old_snapshot (test_runtime.RuntimeTests.test_event_during_draft_invalidates_old_snapshot) ... ok
+test_expired_event_is_not_evaluated (test_runtime.RuntimeTests.test_expired_event_is_not_evaluated) ... ok
+test_expiry_during_generation_is_rechecked (test_runtime.RuntimeTests.test_expiry_during_generation_is_rechecked) ... ok
+test_failure_is_passive (test_runtime.RuntimeTests.test_failure_is_passive) ... ok
+test_local_day_budget_rollover (test_runtime.RuntimeTests.test_local_day_budget_rollover) ... ok
+test_low_evidence_requests_reflection_without_speaking (test_runtime.RuntimeTests.test_low_evidence_requests_reflection_without_speaking) ... ok
+test_missing_receipt_recovered_as_unknown_after_restart (test_runtime.RuntimeTests.test_missing_receipt_recovered_as_unknown_after_restart) ... ok
+test_no_consent_blocks_before_model (test_runtime.RuntimeTests.test_no_consent_blocks_before_model) ... ok
+test_pause_is_a_hard_stop_even_for_direct (test_runtime.RuntimeTests.test_pause_is_a_hard_stop_even_for_direct) ... ok
+test_quiet_blocks_before_model (test_runtime.RuntimeTests.test_quiet_blocks_before_model) ... ok
+test_success (test_runtime.RuntimeTests.test_success) ... ok
+test_unknown_evidence_prevents_generation (test_runtime.RuntimeTests.test_unknown_evidence_prevents_generation) ... ok
+test_unknown_source_is_not_persisted (test_runtime.RuntimeTests.test_unknown_source_is_not_persisted) ... ok
+
+----------------------------------------------------------------------
+Ran 29 tests in 0.091s
+
+OK

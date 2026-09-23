@@ -1,0 +1,13 @@
+{
+  "paused": false,
+  "quiet": false,
+  "busy": false,
+  "cloud_allowed": false,
+  "allowed_sources": ["user", "work", "browser"],
+  "kinds": [
+    {"kind": "task_update", "consent": true, "daily_limit": 3, "cooldown_ms": 1800000},
+    {"kind": "personal_discovery", "consent": false, "daily_limit": 1, "cooldown_ms": 7200000},
+    {"kind": "curiosity_question", "consent": false, "daily_limit": 1, "cooldown_ms": 7200000},
+    {"kind": "social_check_in", "consent": false, "daily_limit": 1, "cooldown_ms": 86400000}
+  ]
+}

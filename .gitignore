@@ -1,0 +1,11 @@
+/target/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite.lock
+__pycache__/
+.venv/
+.env
+
+/.local/
+/artifacts/

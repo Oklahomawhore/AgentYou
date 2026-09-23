@@ -1,0 +1,6 @@
+{"id":"render-1","source":"work","kind":"work_result","text":"用户委托的视频渲染已完成。","created_at_ms":1790035200000,"expires_at_ms":1790035500000,"candidate":{"id":"render-completed","kind":"task_update","proposition":"视频已经渲染完成。","evidence_ids":["render-1"]}}
+{"id":"render-1","source":"work","kind":"work_result","text":"用户委托的视频渲染已完成。","created_at_ms":1790035200000,"expires_at_ms":1790035500000,"candidate":{"id":"render-completed","kind":"task_update","proposition":"视频已经渲染完成。","evidence_ids":["render-1"]}}
+{"id":"render-2","source":"work","kind":"work_result","text":"第二个渲染任务已完成。","created_at_ms":1790035260000,"expires_at_ms":1790035560000,"candidate":{"id":"second-render","kind":"task_update","proposition":"第二个视频已经完成。","evidence_ids":["render-2"]}}
+{"id":"user-1","source":"user","kind":"user_message","text":"告诉我进度。","created_at_ms":1790035320000,"expires_at_ms":1790035620000,"candidate":null}
+{"id":"social-1","source":"work","kind":"wake","text":"社交候选测试。","created_at_ms":1790035380000,"expires_at_ms":1790035680000,"candidate":{"id":"social-check","kind":"social_check_in","proposition":"今天过得怎么样？","evidence_ids":["social-1"]}}
+{"id":"private-1","source":"private-mail","kind":"observation","text":"未授权来源不会入库。","created_at_ms":1790035440000,"expires_at_ms":1790035740000,"candidate":null}

@@ -1,0 +1,19 @@
+name: runtime
+on: [push, pull_request]
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+      - run: python -m unittest discover -s tests -v
+        working-directory: reference
+      - run: cargo run --locked -p mind-runtime -- replay examples/events.jsonl --db /tmp/yourself-ci.sqlite --guards examples/task-updates.json

@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/mind-runtime", "crates/yourself-server"]
+resolver = "2"

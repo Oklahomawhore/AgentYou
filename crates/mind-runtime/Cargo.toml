@@ -1,0 +1,15 @@
+[package]
+name = "mind-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+thiserror = "1"
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

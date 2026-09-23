@@ -1,0 +1,9 @@
+mode: OFFLINE MOCKS
+first: {'status': 'SENT', 'reason': 'receipt_recorded', 'outbox_id': '3e5d7a18-da88-42e1-9b74-38cd347ea3e4'}
+duplicate: {'status': 'DUPLICATE', 'reason': 'event_already_seen', 'outbox_id': None}
+direct user message despite quiet hours: {'status': 'SENT', 'reason': 'receipt_recorded', 'outbox_id': 'd5f14e81-6fd8-4959-8242-c0b183c018f8'}
+affect: {'valence': 0.105, 'arousal': 0.26, 'control': 0.5552, 'updated_at': 1790032201.1243865}
+messages: {
+  "3e5d7a18-da88-42e1-9b74-38cd347ea3e4": "[数字角色·知微] 你刚才等的视频渲染完成了，结果已经通过媒体校验。",
+  "d5f14e81-6fd8-4959-8242-c0b183c018f8": "[本地测试回复] 收到：把结果给我看看。"
+}
