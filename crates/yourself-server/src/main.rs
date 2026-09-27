@@ -36,6 +36,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let actual_port = listener.local_addr()?.port();
     let app = App::open(&data_dir, actual_port).await?;
     let feishu = yourself_server::feishu::start(app.clone());
+    let weixin = yourself_server::weixin::start(app.clone());
     let heartbeat = yourself_server::heartbeat::start(app.clone());
     println!("YourSelf is ready at http://127.0.0.1:{actual_port}");
     axum::serve(listener, app_router(app.clone()))
@@ -44,6 +45,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
     feishu.abort();
+    weixin.abort();
     heartbeat.abort();
     app.mind.shutdown().await?;
     Ok(())

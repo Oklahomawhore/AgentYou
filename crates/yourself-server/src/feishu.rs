@@ -33,6 +33,7 @@ pub fn init(app: &App) -> AppResult<()> {
     app.db.lock().execute_batch("CREATE TABLE IF NOT EXISTS feishu_config(id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS feishu_inbox(remote_id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL, reply_id TEXT, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS feishu_delivery(message_id TEXT PRIMARY KEY, status TEXT NOT NULL, remote_id TEXT, error TEXT, created_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS feishu_stream(message_id TEXT PRIMARY KEY,content TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS feishu_status(id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL, error TEXT, updated_at INTEGER NOT NULL);
       UPDATE feishu_delivery SET status='unknown',error='服务重启，发送回执未知，未自动重发。' WHERE status='sending';").map_err(error)
 }
@@ -74,7 +75,18 @@ fn command(profile: &str) -> Command {
         .stderr(Stdio::piped());
     c
 }
+#[cfg(test)]
+static STREAM_TEST_CALLS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 async fn cli(profile: &str, args: &[&str], body: Option<Value>) -> AppResult<Value> {
+    #[cfg(test)]
+    if profile == "yourself-stream-fixture" {
+        STREAM_TEST_CALLS
+            .lock()
+            .unwrap()
+            .push(json!({"args":args,"body":body}));
+        return Ok(json!({"ok":true,"data":{"message_id":"om_fixture"}}));
+    }
+
     let mut cmd = command(profile);
     cmd.args(args);
     let mut child = cmd
@@ -102,7 +114,12 @@ async fn cli(profile: &str, args: &[&str], body: Option<Value>) -> AppResult<Val
     }
     let value: Value =
         serde_json::from_slice(&output.stdout).map_err(|_| "飞书返回格式异常".to_string())?;
-    if value.get("ok") == Some(&json!(false)) {
+    if value.get("ok") == Some(&json!(false))
+        || value
+            .pointer("/data/code")
+            .and_then(Value::as_i64)
+            .is_some_and(|n| n != 0)
+    {
         return Err("飞书未确认请求成功。".into());
     }
     Ok(value)
@@ -130,6 +147,9 @@ async fn check_identity(c: &Config) -> AppResult<()> {
     Ok(())
 }
 async fn send(c: &Config, id: &str, text: &str) -> AppResult<Value> {
+    if text.trim().is_empty() || text.trim().eq_ignore_ascii_case("(no content)") {
+        return Err("飞书不发送空正文或占位文本。".into());
+    }
     let body = json!({"receive_id":c.owner_id,"msg_type":"text","content":json!({"text":text}).to_string(),"uuid":id});
     let v = cli(
         &c.profile,
@@ -158,6 +178,87 @@ async fn send(c: &Config, id: &str, text: &str) -> AppResult<Value> {
         return Err("未取得飞书发送回执；请检查会话，未自动重发。".into());
     }
     Ok(data.clone())
+}
+async fn edit(c: &Config, remote: &str, text: &str) -> AppResult<()> {
+    if text.trim().is_empty() {
+        return Err("不能更新为空消息".into());
+    }
+    cli(
+        &c.profile,
+        &[
+            "api",
+            "PUT",
+            &format!("/open-apis/im/v1/messages/{remote}"),
+            "--as",
+            "bot",
+            "--data",
+            "-",
+        ],
+        Some(json!({"msg_type":"text","content":json!({"text":text}).to_string()})),
+    )
+    .await?;
+    Ok(())
+}
+/// First visible content creates one message; later chunks replace the same message.
+async fn stream_outbound(app: &Arc<App>, c: &Config) -> AppResult<()> {
+    type StreamRow = (String, String, String, Option<String>, Option<String>);
+    let row: Option<StreamRow> = {
+        let db = app.db.lock();
+        db.query_row("SELECT m.id,m.status,CASE WHEN m.status='failed' THEN m.content||'\n本次回复中断：'||COALESCE(m.error,'请重试') WHEN m.status IN ('cancelled','skipped') THEN '本次回复已停止。' ELSE m.content END,f.remote_id,s.content FROM messages m LEFT JOIN feishu_delivery f ON f.message_id=m.id LEFT JOIN feishu_stream s ON s.message_id=m.id WHERE m.id IN (SELECT reply_id FROM feishu_inbox WHERE created_at>=?) AND ((m.status='pending' AND trim(m.content)!='' AND f.message_id IS NULL) OR f.status='streaming') ORDER BY m.created_at LIMIT 1",[c.since],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(error)?
+    };
+    let Some((id, state, text, remote, last)) = row else {
+        return Ok(());
+    };
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    if let Some(remote) = remote {
+        if last.as_deref() != Some(&text) {
+            if let Err(e) = edit(c, &remote, &text).await {
+                app.db
+                    .lock()
+                    .execute(
+                        "UPDATE feishu_delivery SET error=? WHERE message_id=?",
+                        params![e, id],
+                    )
+                    .map_err(error)?;
+                return Err(e);
+            }
+        }
+    } else {
+        app.db
+            .lock()
+            .execute(
+                "INSERT OR IGNORE INTO feishu_delivery VALUES(?,'sending',NULL,NULL,?)",
+                params![id, data::now()],
+            )
+            .map_err(error)?;
+        match send(c, &id, &text).await {
+            Ok(receipt) => {
+                app.db.lock().execute("UPDATE feishu_delivery SET status='streaming',remote_id=? WHERE message_id=?",params![receipt["message_id"].as_str(),id]).map_err(error)?;
+            }
+            Err(e) => {
+                app.db
+                    .lock()
+                    .execute(
+                        "UPDATE feishu_delivery SET status='unknown',error=? WHERE message_id=?",
+                        params![e, id],
+                    )
+                    .map_err(error)?;
+                return Err(e);
+            }
+        }
+    }
+    let db = app.db.lock();
+    db.execute("INSERT INTO feishu_stream VALUES(?,?) ON CONFLICT(message_id) DO UPDATE SET content=excluded.content",params![id,text]).map_err(error)?;
+    if state != "pending" {
+        db.execute(
+            "UPDATE feishu_delivery SET status='sent',error=NULL WHERE message_id=?",
+            [id],
+        )
+        .map_err(error)?;
+    }
+    Ok(())
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -375,6 +476,7 @@ async fn outbound(app: &Arc<App>, c: &Config) -> AppResult<()> {
     if !live.enabled || live.since != c.since {
         return Ok(());
     }
+    stream_outbound(app, c).await?;
     let settings = app.router.config();
     let proactive_on_feishu = settings.primary_channel == crate::data::PrimaryChannel::Feishu;
     let guards = app.router.config().guards;
@@ -402,7 +504,7 @@ async fn outbound(app: &Arc<App>, c: &Config) -> AppResult<()> {
     }
     let row = {
         let db = app.db.lock();
-        db.execute("INSERT OR IGNORE INTO feishu_delivery SELECT m.id,'queued',NULL,NULL,? FROM messages m WHERE m.status IN ('done','failed') AND m.role='assistant' AND (m.id IN (SELECT reply_id FROM feishu_inbox WHERE created_at>=?) OR (m.mode='proactive' AND m.created_at>=? AND ?))",params![data::now(),c.since,c.since.max(data::now()-300_000),proactive_on_feishu]).map_err(error)?;
+        db.execute("INSERT OR IGNORE INTO feishu_delivery SELECT m.id,'queued',NULL,NULL,? FROM messages m WHERE m.status IN ('done','failed') AND (trim(m.content)!='' OR m.status='failed') AND m.role='assistant' AND (m.id IN (SELECT reply_id FROM feishu_inbox WHERE created_at>=?) OR (m.mode='proactive' AND m.created_at>=? AND ?))",params![data::now(),c.since,c.since.max(data::now()-300_000),proactive_on_feishu]).map_err(error)?;
         let row:Option<(String,String)>=db.query_row("SELECT m.id,CASE WHEN m.status='failed' THEN '本次回复未完成：'||COALESCE(m.error,'请重试') ELSE m.content END FROM feishu_delivery f JOIN messages m ON m.id=f.message_id WHERE f.status='queued' AND (?=0 OR m.mode!='proactive') ORDER BY f.created_at LIMIT 1",[!proactive_on_feishu || guards.paused || guards.quiet || guards.busy || !guards.cloud_allowed],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(error)?;
         row
     };
@@ -526,6 +628,68 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+    #[tokio::test]
+    async fn stream_creates_only_after_text_and_updates_one_message() {
+        STREAM_TEST_CALLS.lock().unwrap().clear();
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::open(dir.path(), 4317).await.unwrap();
+        let c = Config {
+            enabled: true,
+            profile: "yourself-stream-fixture".into(),
+            since: 0,
+            ..Default::default()
+        };
+        let request = uuid::Uuid::new_v4().to_string();
+        let reply = app.db.begin_chat(&request, "hello").unwrap().unwrap();
+        app.db
+            .lock()
+            .execute(
+                "INSERT INTO feishu_inbox VALUES('remote',?,'','accepted',?,0)",
+                params![request, reply],
+            )
+            .unwrap();
+        stream_outbound(&app, &c).await.unwrap();
+        assert!(STREAM_TEST_CALLS.lock().unwrap().is_empty());
+        for text in ["first", "first second"] {
+            app.db
+                .lock()
+                .execute(
+                    "UPDATE messages SET content=? WHERE id=?",
+                    params![text, reply],
+                )
+                .unwrap();
+            stream_outbound(&app, &c).await.unwrap();
+        }
+        app.db
+            .complete_chat(&reply, "first second final", &[])
+            .unwrap();
+        stream_outbound(&app, &c).await.unwrap();
+        stream_outbound(&app, &c).await.unwrap();
+        {
+            let calls = STREAM_TEST_CALLS.lock().unwrap();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[0]["args"][1], "POST");
+            for call in &calls[1..] {
+                assert_eq!(call["args"][1], "PUT");
+                assert_eq!(call["args"][2], "/open-apis/im/v1/messages/om_fixture");
+            }
+            let text: Value =
+                serde_json::from_str(calls[2]["body"]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(text["text"], "first second final");
+        }
+        let state: String = app
+            .db
+            .lock()
+            .query_row(
+                "SELECT status FROM feishu_delivery WHERE message_id=?",
+                [reply],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "sent");
+        app.mind.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn inbox_deduplicates_controls_work_without_model_and_restart_is_safe() {
         let dir = tempfile::tempdir().unwrap();

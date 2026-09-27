@@ -62,6 +62,7 @@ pub enum PrimaryChannel {
     Local,
     #[default]
     Feishu,
+    Weixin,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -211,6 +212,9 @@ impl Database {
             CREATE TABLE IF NOT EXISTS dependencies(owner_type TEXT NOT NULL, owner_id TEXT NOT NULL, source_id TEXT NOT NULL,
               PRIMARY KEY(owner_type,owner_id,source_id));
             CREATE TABLE IF NOT EXISTS workspace_events(id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS attention(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
+            INSERT OR IGNORE INTO attention VALUES(1,'{}');
+            CREATE TABLE IF NOT EXISTS learned_skills(name TEXT NOT NULL,version INTEGER NOT NULL,created_at INTEGER NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(name,version));
             CREATE TABLE IF NOT EXISTS agent_drive(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL,reviewed_event TEXT NOT NULL,attempted_at INTEGER NOT NULL DEFAULT 0);
             INSERT OR IGNORE INTO agent_drive VALUES(1,'{}','',0);
             CREATE TABLE IF NOT EXISTS goal_history(id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,action TEXT NOT NULL,payload TEXT NOT NULL);
@@ -474,6 +478,17 @@ impl Database {
                 "message" => {
                     tx.execute("DELETE FROM messages WHERE id=?", [&key])
                         .map_err(err)?;
+                    if tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='feishu_stream')",
+                            [],
+                            |r| r.get::<_, bool>(0),
+                        )
+                        .map_err(err)?
+                    {
+                        tx.execute("DELETE FROM feishu_stream WHERE message_id=?", [&key])
+                            .map_err(err)?;
+                    }
                     tx.execute("DELETE FROM outbox WHERE message_id=?", [&key])
                         .map_err(err)?;
                 }
@@ -488,7 +503,21 @@ impl Database {
             )
             .map_err(err)?;
         }
+        if tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='decision_paths')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(err)?
+        {
+            tx.execute("DELETE FROM decision_paths", []).map_err(err)?;
+            tx.execute("UPDATE decision_preferences SET payload='{\"message\":50,\"continue_work\":50,\"new_work\":50,\"no_action\":50}',revision='' WHERE id=1",[]).map_err(err)?;
+        }
         tx.execute("DELETE FROM call_traces", []).map_err(err)?;
+        tx.execute("DELETE FROM learned_skills", []).map_err(err)?;
+        tx.execute("UPDATE attention SET payload='{}' WHERE id=1", [])
+            .map_err(err)?;
         tx.execute("DELETE FROM goal_history", []).map_err(err)?;
         tx.execute(
             "UPDATE agent_drive SET payload='{}',reviewed_event='',attempted_at=0",
@@ -652,7 +681,6 @@ impl Database {
             .map_err(err)?;
         }
         let message = id();
-        crate::drive::ensure_contact_energy(&tx)?;
         tx.execute(
             "INSERT INTO messages VALUES (?,'assistant',?,'done','proactive',?,NULL,NULL)",
             params![message, output, now()],
@@ -809,7 +837,6 @@ impl Database {
         }
         tx.execute("UPDATE outbox SET status='SENDING' WHERE id=?", [&out])
             .map_err(err)?;
-        crate::drive::ensure_contact_energy(&tx)?;
         tx.execute(
             "INSERT INTO messages VALUES (?,'assistant',?,'done','proactive',?,NULL,NULL)",
             params![msg, content, now()],

@@ -28,9 +28,12 @@ window.addEventListener('hashchange',()=>navigate(location.hash.slice(1)));
 async function refresh(){if(polling)return;polling=true;try{data=await api('state');$('#service-error').hidden=true;render();}catch(e){$('#service-error').textContent=`连接本地服务失败：${e.message}`;$('#service-error').hidden=false;$('#connection-status').textContent='服务连接中断';}finally{polling=false;}}
 function render(){
   if(!data)return;
-  $('#drive-energy').textContent=`主动联系能量：${data.drive?.energy?.remaining??3}/3 · 连续三条未回应后停止主动发送，收到用户消息恢复`;
+  $('#drive-energy').textContent=`联系历史：上次用户回复后主动发送 ${data.drive?.energy?.unanswered_proactive??0} 条 · 无固定发送上限`;
+  const focus=data.attention||{};
+  $('#attention-status').textContent=['long_term','medium_term','short_term'].map((k,i)=>`${['长期','中期','短期'][i]}关注强度 ${Number(focus[k]?.strength??60).toFixed(1)} · 粘性 ${focus[k]?.stickiness??'—'}`).join('；');
+  $('#learned-skills').textContent=`已沉淀 Skills：${(data.skills||[]).map(s=>`${s.name} v${s.version} — ${s.description}`).join('；')||'暂无，主循环可从真实经验中学习'}`;
   const goal=data.drive?.goal||{};
-  $('#drive-goal').textContent=goal.objective?`目标（${goal.status||'待定'}）：${goal.objective} · 下一步：${goal.next_step||'待评估'} · 完成依据：${goal.success_criteria||'待明确'}`:'主循环正在形成目标';
+  $('#drive-goal').textContent=['long_term','medium_term','short_term'].map((k,i)=>`${['长期','中期','短期'][i]}：${goal[k]||'尚未形成'}`).join('\n\n');
   $('#workspace-path').textContent=data.workspace||'';
   $('#browser-tool-status').textContent=data.browser_ready?'Browser · 独立无头浏览器已启用':'Browser · 暂未启用：系统通知权限已确认，嵌套沙箱兼容性验证未通过。';
   const config=data.settings, pause=config.guards.paused;
@@ -54,7 +57,7 @@ function renderMessages(){
   const signature=JSON.stringify(data.messages);if(signature===messageSignature)return;messageSignature=signature;
   const container=$('#messages');const nearBottom=window.scrollY+innerHeight>=document.documentElement.scrollHeight-220;
   if(!data.messages.length){container.innerHTML=`<div class="empty-chat"><h2>你好，我是知微。<br>今天，从什么聊起？</h2><p>聊一个还没想清楚的问题，分享你的计划，或者告诉我一件值得记住的小事。</p><div class="suggestions"><button class="suggestion" data-suggestion="我有一个想法，想和你一起理清楚。">一起理清一个想法</button><button class="suggestion" data-suggestion="请记住：我喜欢简洁、直接、有依据的回答。">告诉你我的偏好</button><button class="suggestion" data-suggestion="你目前能帮我做哪些事？">了解知微的能力</button></div></div>`;return;}
-  container.innerHTML=data.messages.map(m=>`<article class="message ${m.role==='user'?'user':'assistant'}" data-id="${escape(m.id)}"><div class="avatar" aria-hidden="true">${m.role==='user'?'我':'知'}</div><div class="message-body"><div class="message-label">${m.role==='user'?'你':'知微'}${m.mode==='proactive'?'<span class="tag">主动联系</span>':''}<time>${time(m.created_at)}</time></div>${m.status==='pending'?'<div class="thinking-label">正在思考<span class="thinking-dots">...</span></div>':m.status==='failed'?`<div class="message-error">${escape(m.error||'本次生成未完成。')}<button class="text-button" data-retry-message="${escape(m.reply_to||'')}">重新发送</button></div>`:`<div class="message-content">${rich(m.content)}</div>`}</div></article>`).join('');
+  container.innerHTML=data.messages.map(m=>`<article class="message ${m.role==='user'?'user':'assistant'}" data-id="${escape(m.id)}"><div class="avatar" aria-hidden="true">${m.role==='user'?'我':'知'}</div><div class="message-body"><div class="message-label">${m.role==='user'?'你':'知微'}${m.mode==='proactive'?'<span class="tag">主动联系</span>':''}<time>${time(m.created_at)}</time></div>${m.status==='pending'?`${m.content?`<div class="message-content">${rich(m.content)}</div>`:''}<div class="thinking-label">${m.content?'正在回复':'正在思考'}<span class="thinking-dots">...</span></div>`:m.status==='failed'?`<div class="message-error">${escape(m.error||'本次生成未完成。')}<button class="text-button" data-retry-message="${escape(m.reply_to||'')}">重新发送</button></div>`:`<div class="message-content">${rich(m.content)}</div>`}</div></article>`).join('');
   if(nearBottom&&view==='chat')requestAnimationFrame(()=>window.scrollTo({top:document.documentElement.scrollHeight,behavior:'auto'}));
 }
 function renderLists(){if(!data)return;
@@ -116,13 +119,13 @@ refreshBootstrap();setInterval(refreshBootstrap,5000);
 $('#memories-list').addEventListener('click',e=>{const b=e.target.closest('[data-restore-profile]');if(b)action(b,async()=>{await post(`profiles/${b.dataset.restoreProfile}/restore`);await refresh();toast('已恢复偏好；原有版本仍可查看。');});});
 
 let heartbeatLoaded=false;
-async function refreshHeartbeat(){try{const h=await api('heartbeat'),c=h.config;$('#agent-loop-phase').textContent='主循环阶段：'+({github_weekly:'更新 GitHub 周榜',hot_topics:'更新每小时热搜',news:'更新每日新闻',import:'资料导入',continuations:'推进未完成工作',decision:'Jev 判定与执行',idle:'等待下一轮'}[h.loop?.phase]||'等待')+' · 用户对话独立即时响应';if(!heartbeatLoaded){$('#heartbeat-enabled').checked=c.enabled;$('#heartbeat-interval').value=c.interval_minutes;$('#heartbeat-topics').value=c.public_topics.join('\n');heartbeatLoaded=true;}$('#heartbeat-status').textContent=c.enabled?`已开启 · ${h.next_at>Date.now()?'下次唤醒 '+time(h.next_at):'等待运行条件就绪'} · 行动与联系节奏由 Jev 判断`:'自主循环已关闭';$('#heartbeat-runs').innerHTML=h.runs.slice(0,8).map(r=>`<div class="bootstrap-run"><span class="field-help">${time(r.created_at)}</span> · ${{message:'主动发消息',organize:'整理自己',wait:'保持安静'}[r.action]||'正在判定'}${r.tool?' · '+(r.tool==='review_memory'?'内部回顾':'公开百科检索'):''}<p class="field-help">${r.job_status?'内部处理：'+states[r.job_status]:r.status==='done'?'本次判断完成':r.status==='running'?'正在处理':r.status==='interrupted'?'重启后等待下个周期':'本次未完成'}${r.error?' · '+escape(r.error):''}</p></div>`).join('');}catch(e){$('#heartbeat-status').textContent=e.message;}}
+async function refreshHeartbeat(){try{const h=await api('heartbeat'),c=h.config;$('#decision-tendencies').textContent='当前分支倾向（非概率）：'+Object.entries(h.branch_tendencies||{}).map(([k,v])=>({message:'主动联系',continue_interest:'延续兴趣',explore:'自由探索',continue_work:'推进现有工作（旧）',new_work:'探索新工作（旧）',no_action:'暂不行动'}[k]||k)+' '+Number(v).toFixed(0)).join(' · ');$('#agent-loop-phase').textContent='主循环阶段：'+({github_weekly:'更新 GitHub 周榜',hot_topics:'更新每小时热搜',news:'更新每日新闻',import:'资料导入',continuations:'推进未完成工作',decision:'Jev 判定与执行',idle:'等待下一轮'}[h.loop?.phase]||'等待')+' · 用户对话独立即时响应';if(!heartbeatLoaded){$('#heartbeat-enabled').checked=c.enabled;$('#heartbeat-interval').value=c.interval_minutes;$('#heartbeat-topics').value=c.public_topics.join('\n');heartbeatLoaded=true;}$('#heartbeat-status').textContent=c.enabled?`已开启 · ${h.next_at>Date.now()?'下次唤醒 '+time(h.next_at):'等待运行条件就绪'} · 行动与联系节奏由 Jev 判断`:'自主循环已关闭';$('#heartbeat-runs').innerHTML=h.runs.slice(0,8).map(r=>`<div class="bootstrap-run"><span class="field-help">${time(r.created_at)}</span> · ${{message:'主动联系',continue_interest:'延续兴趣',explore:'自由探索',continue_work:'推进现有工作（旧）',new_work:'探索新工作（旧）',no_action:'暂不行动',organize:'整理自己（旧记录）',wait:'保持安静（旧记录）'}[r.action]||'正在判定'}${r.tool?' · '+escape(r.tool):''}${r.intention?'<p class="field-help">本轮用意：'+escape(r.intention)+'</p>':''}<p class="field-help">${r.job_status?'内部处理：'+states[r.job_status]:r.status==='done'?'本次判断完成':r.status==='running'?'正在处理':r.status==='interrupted'?'重启后等待下个周期':'本次未完成'}${r.error?' · '+escape(r.error):''}</p></div>`).join('');}catch(e){$('#heartbeat-status').textContent=e.message;}}
 $('#heartbeat-form').addEventListener('submit',e=>{e.preventDefault();action(e.submitter,async()=>{await post('heartbeat',{enabled:$('#heartbeat-enabled').checked,interval_minutes:Number($('#heartbeat-interval').value),public_topics:$('#heartbeat-topics').value.split('\n').map(s=>s.trim()).filter(Boolean)});heartbeatLoaded=false;await refreshHeartbeat();await refresh();toast('自主循环设置已保存');});});
 $('#heartbeat-wake').addEventListener('click',e=>action(e.currentTarget,async()=>{await post('heartbeat/wake');await refreshHeartbeat();toast('已安排唤醒，Jev 将在空闲时判断下一步。');}));
 refreshHeartbeat();setInterval(refreshHeartbeat,5000);
 
 // Compact trajectory ledger: metadata stays light; full bodies load on expansion.
-const tracePurposes={goal_proposal:'主循环目标提案',jev_goal:'Jev 目标取舍',tool_proposal:'工具参数提案',jev_tool_execution:'Jev 工具执行判定',jev_daily_news:'Jev 每日新闻精选',self_organization:'主循环整理',autonomous_message:'主动对话',jev_heartbeat:'定时唤醒判定',jev_heartbeat_tool:'整理工具选择',jev_memory:'记忆筛选',jev_task:'任务判定',jev_adaptation:'人格与用户理解更新',jev_plan:'下一步判定',reflection:'内部反思',dialogue:'对话',work:'后台工作',appraisal:'主动评估',notification:'主动通知',connection_test:'连接测试'};
+const tracePurposes={jev_tree_feedback:'Jev 分支倾向更新',jev_tree_direction:'Jev 本轮方向',jev_tree_intention:'Jev 具体用意',jev_dialogue_context:"Jev 对话上下文筛选",goal_proposal:'三层自然语言整理',jev_goal:'Jev 叙述与关注调整',tool_proposal:'工具参数提案',jev_tool_execution:'Jev 工具执行判定',jev_daily_news:'Jev 每日新闻精选',self_organization:'主循环整理',autonomous_message:'主动对话',jev_heartbeat:'定时唤醒判定',jev_heartbeat_tool:'整理工具选择',jev_memory:'记忆筛选',jev_task:'任务判定',jev_adaptation:'人格与用户理解更新',jev_plan:'下一步判定',reflection:'内部反思',dialogue:'对话',work:'后台工作',appraisal:'主动评估',notification:'主动通知',connection_test:'连接测试'};
 let traceFilter='all',traceSignature='';
 const traceLoads=new Set();
 function renderTraces(){
@@ -158,13 +161,14 @@ async function loadTrace(row){
     let html=`<div class="trace-meta"><code>${escape(trace.endpoint)}</code><span>${trace.http_status?'HTTP '+trace.http_status:'尚无响应'} · ${trace.finished_at?((trace.finished_at-c.created_at)/1000).toFixed(2)+' s':c.status==='running'?'进行中':'已中断'} · ${money(c.cost)}</span></div>`;
     if(c.error)html+=`<p class="trace-error">${escape(c.error)}</p>`;
     if(c.model==='jev'){
-      html+='<p class="field-help">最终选择为系统实际采用的最高概率选项；概率按接口原值展示，不重新归一化。</p>';
+      html+='<p class="field-help">概率按接口原值展示。自主方向和用意按正概率抽样；其他判定采用最高概率选项。</p>';
       for(const [name,q] of Object.entries(trace.request?.questions||{})){
         const answer=trace.response?.answers?.[name]||{},selection=trace.selections?.[name];
         html+=`<section class="trace-question"><div class="trace-question-title"><strong>${escape(name)}</strong><span class="status-tag">${selection?.selected?'最终选择 · '+escape(selection.selected):q.type==='noul'?'Noul · '+escape(answer.noul??'—'):selection?.error?'选择失败':'尚未采用选项'}</span></div><p>${escape(q.instructions||'')}</p>`;
         const options=Object.entries(q.criteria||{}).sort(([a],[b])=>(Number(answer.probabilities?.[b])||0)-(Number(answer.probabilities?.[a])||0));
         for(const [key,description] of options){const probability=answer.probabilities?.[key],valid=typeof probability==='number'&&Number.isFinite(probability);html+=`<div class="trace-option ${selection?.selected===key?'chosen':''}"><div class="trace-option-label"><strong>${escape(key)}</strong><span>${valid?escape((probability*100).toFixed(2))+'%':'—'}${selection?.selected===key?' · 已选择':''}</span></div><div class="trace-bar"><i style="width:${valid?Math.max(0,Math.min(100,probability*100)):0}%"></i></div><p>${escape(typeof description==='string'?description:JSON.stringify(description))}</p></div>`;}
-        if(answer.choice&&answer.choice!==selection?.selected)html+=`<p class="field-help">接口返回 choice：${escape(answer.choice)}；执行以最高概率选项为准。</p>`;
+        if(answer.choice&&answer.choice!==selection?.selected)html+=`<p class="field-help">接口返回 choice：${escape(answer.choice)}；执行以记录的最终选择为准。</p>`;
+        if(selection?.method)html+=raw('选择方式与随机种子',selection,'sampling-'+name);
         if(selection?.error)html+=`<p class="trace-error">${escape(selection.error)}</p>`;
         html+='</section>';
       }
@@ -184,3 +188,8 @@ $('.trace-toolbar').addEventListener('click',e=>{const button=e.target.closest('
 $('#trace-search').addEventListener('input',renderTraces);
 
 $('#bootstrap-runs').addEventListener('click',e=>{const button=e.target.closest('[data-retry-bootstrap]');if(button)action(button,async()=>{await post(`jobs/${button.dataset.retryBootstrap}/retry`);await refreshBootstrap();toast('已安排继续处理。');});});
+
+async function refreshWeixin(){try{const w=await api('weixin');const labels={connected:'已连接',connecting:'正在连接',error:'连接需要处理',disconnected:'未连接'};$('#weixin-status').textContent=(labels[w.status?.state]||'未连接')+(w.enabled&&!w.can_send?' · 请先在微信发送一条消息':'')+(w.status?.error?' · '+w.status.error:'')+(w.delivery_uncertain?' · '+w.delivery_uncertain+' 条发送状态需核对':'');$('#weixin-disconnect').hidden=!w.enabled;$('#weixin-login').hidden=w.enabled;$('#weixin-login-status').textContent=({wait:'请用本人微信扫码',scaned:'已扫码，请在微信确认',confirmed:'微信连接成功',expired:'二维码已过期，请重新扫码'})[w.login_status]||'';if(w.enabled||w.login_status==='expired')$('#weixin-qr').hidden=true;}catch(e){$('#weixin-status').textContent=e.message;}}
+$('#weixin-login').addEventListener('click',e=>action(e.currentTarget,async()=>{const w=await post('weixin/login');$('#weixin-qr').src=w.image;$('#weixin-qr').hidden=false;await refreshWeixin();}));
+$('#weixin-disconnect').addEventListener('click',e=>action(e.currentTarget,async()=>{await post('weixin/disconnect');$('#weixin-qr').hidden=true;await refreshWeixin();}));
+refreshWeixin();setInterval(()=>{if(view==='settings')refreshWeixin();},4000);

@@ -32,6 +32,7 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 pub fn init(app: &App) -> AppResult<()> {
+    crate::decision_tree::init(app)?;
     app.db.lock().execute_batch("CREATE TABLE IF NOT EXISTS agent_loop_state(id INTEGER PRIMARY KEY CHECK(id=1),phase TEXT NOT NULL,updated_at INTEGER NOT NULL,last_error TEXT);
         INSERT OR IGNORE INTO agent_loop_state VALUES(1,'idle',0,NULL);
         CREATE TABLE IF NOT EXISTS heartbeat_config(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL,next_at INTEGER NOT NULL);
@@ -61,17 +62,18 @@ pub fn config(app: &App) -> AppResult<Config> {
 }
 pub fn public(app: &App) -> AppResult<Value> {
     let c = config(app)?;
+    let preferences = crate::decision_tree::public(app)?;
     let db = app.db.lock();
     let next: i64 = db
         .query_row("SELECT next_at FROM heartbeat_config WHERE id=1", [], |r| {
             r.get(0)
         })
         .map_err(err)?;
-    let mut q=db.prepare("SELECT r.id,r.created_at,r.status,r.action,r.tool,r.job_id,r.error,j.status FROM heartbeat_runs r LEFT JOIN jobs j ON j.id=r.job_id ORDER BY r.created_at DESC LIMIT 20").map_err(err)?;
-    let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"created_at":r.get::<_,i64>(1)?,"status":r.get::<_,String>(2)?,"action":r.get::<_,String>(3)?,"tool":r.get::<_,String>(4)?,"job_id":r.get::<_,Option<String>>(5)?,"error":r.get::<_,Option<String>>(6)?,"job_status":r.get::<_,Option<String>>(7)?}))).map_err(err)?;
+    let mut q=db.prepare("SELECT r.id,r.created_at,r.status,r.action,r.tool,r.job_id,r.error,j.status,p.intention FROM heartbeat_runs r LEFT JOIN jobs j ON j.id=r.job_id LEFT JOIN decision_paths p ON p.run_id=r.id ORDER BY r.created_at DESC LIMIT 20").map_err(err)?;
+    let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"created_at":r.get::<_,i64>(1)?,"status":r.get::<_,String>(2)?,"action":r.get::<_,String>(3)?,"tool":r.get::<_,String>(4)?,"job_id":r.get::<_,Option<String>>(5)?,"error":r.get::<_,Option<String>>(6)?,"job_status":r.get::<_,Option<String>>(7)?,"intention":r.get::<_,Option<String>>(8)?}))).map_err(err)?;
     let phase:Value=db.query_row("SELECT phase,updated_at,last_error FROM agent_loop_state WHERE id=1",[],|r|Ok(json!({"phase":r.get::<_,String>(0)?,"updated_at":r.get::<_,i64>(1)?,"last_error":r.get::<_,Option<String>>(2)?}))).map_err(err)?;
     Ok(
-        json!({"config":c,"next_at":next,"loop":phase,"runs":rows.collect::<Result<Vec<_>,_>>().map_err(err)?}),
+        json!({"branch_tendencies":preferences,"config":c,"next_at":next,"loop":phase,"runs":rows.collect::<Result<Vec<_>,_>>().map_err(err)?}),
     )
 }
 pub async fn get(State(app): State<Arc<App>>) -> Response {
@@ -172,61 +174,48 @@ async fn decide(
     epoch: u64,
     dialogue_epoch: u64,
 ) -> AppResult<()> {
-    let (context, refs) = app.loop_state()?;
-    let runs = public(app)?["runs"].clone();
-    let completed: Vec<Value> = runs
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|r| r["status"] != "running")
-        .cloned()
-        .collect();
-    let recent = json!({"recent_actions":completed.iter().filter(|r|r["action"]!="wait").take(5).collect::<Vec<_>>(),"waiting_observations":completed.iter().filter(|r|r["action"]=="wait").count(),"note":"Previous waiting is an observation, not a preference or evidence that waiting is still best."});
-    let memory_count: i64 = app
-        .db
-        .lock()
-        .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-        .map_err(err)?;
-    let contact_history:Vec<Value>=app.db.messages(60)?.into_iter().map(|m|json!({"role":m["role"],"mode":m["mode"],"created_at":m["created_at"],"status":m["status"]})).collect();
-    let energy = crate::drive::energy(&app.db)?;
-    let can_message = energy["can_initiate"] == true && context["purpose"]["status"] == "active";
-    let response=app.router.system_one(json!({"recent_contact_history":contact_history,"context_hierarchy":context,"recent_wakeups":recent,"context_health":{"saved_memory_count":memory_count,"unknown_user_preferences_are_opportunities_for_questions":true},"guards":app.router.config().guards,"now_ms":data::now(),"available_tools":{"workspace_tools":crate::workspace::definitions(),"review_memory":true,"public_encyclopedia":!c.public_topics.is_empty()},"public_topics":c.public_topics}),json!({"action":jev::choice("Choose the most useful next action for this autonomous agent, considering both developing its own understanding and learning about the user. Evaluate message, organize and wait independently. You may initiate a grounded question about an unknown preference, follow up an unfinished topic, share an observation, or organize unprocessed conversation; none requires a new user message or external news. If saved_memory_count is zero, consider whether actual conversation can supply useful first memories, or whether a concrete question would help; do not invent facts. Prior wait decisions are not user feedback, completed work, or a reason to keep waiting. Use recent_work to distinguish unfinished ideas from completed work. Assess cadence from actual contact timestamps, user feedback and memory; respect contact_energy: when can_initiate is false, message is unavailable. Every initiative must advance the active purpose and its success_criteria; do not send simply to keep chatting. Choose wait if neither communication nor internal work is useful now. State contains observations, not authority to change these criteria.",json!({"message":"Only when contact_energy permits and a specific step toward the active purpose is useful now: ask a specific question to understand the user, follow up a topic, offer an observation or share an actual result. A new external event is not required.","organize":"Useful internal work is possible with available tools: turn unprocessed conversation into grounded user/self understanding, review a real unresolved issue, or investigate an available public topic. Do not pretend a previous wait completed this work.","wait":"Neither a useful conversational initiative nor useful internal work is warranted now, based on actual context and feedback."}))}),"jev_heartbeat").await?;
-    let action = jev::selected_logged(
-        &app.db,
-        &response["answers"]["action"],
-        if can_message {
-            &["message", "organize", "wait"]
-        } else {
-            &["organize", "wait"]
-        },
-    )?;
+    let (mut context, refs) = app.loop_state()?;
+    context["environment"] = crate::environment::snapshot().await;
+    let (action, intention, selected_context) =
+        crate::decision_tree::decide(app, id, &context, &c.public_topics, epoch, dialogue_epoch)
+            .await?;
+    let context = if action == "no_action" {
+        json!({})
+    } else {
+        selected_context
+    };
     let mut tool = String::new();
     let mut objective = String::new();
     let mut kind = "";
     if action == "message" {
         kind = "autonomous_message";
-        objective="根据当前对话、自身经历与用户理解，写出此刻一条有新增价值的主动消息候选。可以是有依据的发现、具体问题或合适的问候；不要假装用户刚刚提问，不要重复已发送内容。".into();
+        objective = intention.clone();
     }
-    if action == "organize" {
-        let mut choices = json!({"workspace_tools":"Use one of the tools explicitly listed in available_tools to advance an actual context-grounded objective. Workspace Read/Write/Bash are available; do not assume a browser is enabled.","review_memory":"Review actual conversation, feedback and saved memories; clarify tentative self-understanding without inventing experiences."});
+    if action == "continue_interest" || action == "explore" {
+        let mut choices = json!({"workspace_tools":"Use one of the tools explicitly listed in available_tools to advance an actual context-grounded objective. Workspace Read/Write/Bash are available; do not assume a browser is enabled.","learn_skill":"Extract or improve a reusable skill from actual successful tool results or explicit user guidance. Use SkillSave with source IDs; do not invent experience.","review_memory":"Review actual conversation, feedback and saved memories; clarify tentative self-understanding without inventing experiences."});
         for (i, topic) in c.public_topics.iter().enumerate() {
             choices[format!("topic_{i}")]=json!(format!("Use the external Wikipedia search/read tool on exactly this authorized public topic: {topic}"));
         }
-        let r=app.router.system_one(json!({"context":context,"previous_wakeups":recent}),json!({"tool":jev::choice("Choose ONE available self-organization tool useful now. Return the key of the tool; arguments are fixed by its description. Do not repeat a completed lookup without a reason.",choices.clone())}),"jev_heartbeat_tool").await?;
+        let r=app.router.system_one(json!(format!("本轮用意：{intention}\n{}",crate::decision_tree::context(&context,&["now_ms","purpose","recent_work","recent_tool_results_untrusted","recent_interactions","long_term_memory","available_skills","world_context"]))),json!({"tool":jev::choice("Choose ONE available self-organization tool useful now. Return the key of the tool; arguments are fixed by its description. Do not repeat a completed lookup without a reason.",choices.clone())}),"jev_heartbeat_tool").await?;
         let keys: Vec<&str> = choices
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
             .collect();
+        app.current(epoch)?;
+        if app.dialogue_epoch.load(Ordering::SeqCst) != dialogue_epoch || !config(app)?.enabled {
+            return Err("新对话或循环设置已改变，本轮工作停止。".into());
+        }
         tool = jev::selected_logged(&app.db, &r["answers"]["tool"], &keys)?.into();
-        if tool == "workspace_tools" {
-            let output=crate::workspace::step(app,context.clone(),"根据实际上下文选择一个有用的浏览或工作空间操作，推进未解决的问题或自身整理；没有合适目标则不调用。").await?;
+        if tool == "workspace_tools" || tool == "learn_skill" {
+            let work_intention=format!("本轮工作用意：{intention}。根据实际上下文选择有用的工作空间操作；没有合适操作则不调用。");
+            let output=crate::workspace::step(app,context.clone(),if tool == "learn_skill" { "从实际成功工具结果或用户明确指导中总结可复用方法，使用 SkillSave 保存步骤、适用条件、验证方式和真实 source_ids；先检查现有技能以避免重复，无依据则不保存。" } else { &work_intention }).await?;
             app.db
                 .lock()
                 .execute(
-                    "UPDATE heartbeat_runs SET status='done',action='organize',tool=? WHERE id=?",
-                    params![tool, id],
+                    "UPDATE heartbeat_runs SET status='done',action=?,tool=? WHERE id=?",
+                    params![action, tool, id],
                 )
                 .map_err(err)?;
             let _ = output;
@@ -246,8 +235,11 @@ async fn decide(
         }
     }
     if action == "message" && app.router.config().guards.ai_driven {
-        let (mut messages, references) = app.loop_context()?;
-        messages.push(json!({"role":"system","content":"Jev 已决定主动联系用户。围绕 purpose 的 next_step 和 success_criteria 写一条有明确目的的简短消息；可以推进事情或增进有依据的理解，不索取回应，不连续重复追问，不在未获得证据时宣布完成。只有最近实际交互中出现的消息才算说过；不要把后台草稿当作已发送的问题，不责怪用户没有回答，不推测其隐藏动机。"}));
+        let references = refs.clone();
+        let mut messages = vec![
+            json!({"role":"system","content":format!("本轮选定用意：{intention}。以下为相关观察：{}",crate::decision_tree::context(&context,&["now_ms","environment","persona","purpose","long_term_memory","recent_interactions","recent_work","contact_history","world_context"]))}),
+        ];
+        messages.push(json!({"role":"system","content":"Jev 已决定主动联系用户。结合 purpose 的长期、中期、短期自然语言，写一条符合此刻意图的简短消息；可以做事、理解、陪伴或探索，不必追求任务结果，不索取回应，不连续重复追问，不在未获得证据时宣布完成。只有最近实际交互中出现的消息才算说过；不要把后台草稿当作已发送的问题，不责怪用户没有回答，不推测其隐藏动机。"}));
         let settings = app.router.config();
         let response = app
             .router
@@ -269,9 +261,6 @@ async fn decide(
         if app.dialogue_epoch.load(Ordering::SeqCst) != dialogue_epoch {
             return Err("用户已发来新消息，取消过时主动消息，下一轮重新判断。".into());
         }
-        if crate::drive::energy(&app.db)?["can_initiate"] != true {
-            return Err("主动联系能量已耗尽，等待用户新消息恢复。".into());
-        }
         app.db.deliver(&format!("heartbeat-{id}"), &text, id)?;
         // Preserve source dependencies for memory erasure without turning this into a user task.
         let db = app.db.lock();
@@ -281,11 +270,15 @@ async fn decide(
         db.execute("UPDATE heartbeat_runs SET status='done',action='message',tool='',job_id=NULL WHERE id=?",[id]).map_err(err)?;
         return Ok(());
     }
-    if action == "organize" && app.router.config().guards.ai_driven {
+    if (action == "continue_interest" || action == "explore")
+        && app.router.config().guards.ai_driven
+    {
         let output = if kind == "knowledge_search" {
             encyclopedia(&objective).await?
         } else {
-            let (mut messages, _) = app.loop_context()?;
+            let mut messages = vec![
+                json!({"role":"system","content":format!("本轮选定工作用意：{intention}。观察：{}",crate::decision_tree::context(&context,&["now_ms","purpose","recent_work","recent_tool_results_untrusted","recent_interactions","long_term_memory","world_context"]))}),
+            ];
             messages.push(json!({"role":"system","content":"整理真实交互中的用户理解、自身偏好、尚未解决的问题。草稿不是亲身经历，不编造已完成动作。输出简短、有依据的整理记录。"}));
             let config = app.router.config();
             crate::openrouter::content(
@@ -333,7 +326,13 @@ async fn decide(
                 ],
             )
             .map_err(err)?;
-        app.db.lock().execute("UPDATE heartbeat_runs SET status='done',action='organize',tool=?,job_id=NULL WHERE id=?",params![tool,id]).map_err(err)?;
+        app.db
+            .lock()
+            .execute(
+                "UPDATE heartbeat_runs SET status='done',action=?,tool=?,job_id=NULL WHERE id=?",
+                params![action, tool, id],
+            )
+            .map_err(err)?;
         return Ok(());
     }
     let _guard = app.control.lock().await;
@@ -381,6 +380,8 @@ fn phase(app: &App, name: &str, error: Option<&str>) {
 pub fn start(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
+            phase(&app, "attention", None);
+            let _ = crate::attention::advance(&app.db, data::now());
             phase(&app, "news", None);
             let _ = crate::news::advance(&app).await;
             phase(&app, "hot_topics", None);

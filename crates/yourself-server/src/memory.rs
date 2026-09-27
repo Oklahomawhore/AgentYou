@@ -50,8 +50,8 @@ impl OpenRouter {
             .into_iter()
             .take(20)
             .collect();
-        for (i, m) in previous.iter().enumerate() {
-            questions.insert(format!("revision_{i}"),crate::jev::choice(&format!("Does the NEW material explicitly correct or replace state.existing[{i}]? Existing entry: {m}. Never replace a fact merely because of a speculative hypothesis or generated draft. Historical imports are not necessarily more recent; prefer keep unless correction chronology is clear."),json!({"keep":"Existing knowledge remains valid or conflict is unresolved.","supersede":"New retained material explicitly corrects/replaces this old understanding; preserve old version but stop using it as current."})));
+        for (i, _) in previous.iter().enumerate() {
+            questions.insert(format!("revision_{i}"),crate::jev::choice(&format!("Does the NEW material explicitly correct or replace state.existing[{i}]? Read the exact indexed entry from state.existing. Never replace a fact merely because of a speculative hypothesis or generated draft. Historical imports are not necessarily more recent; prefer keep unless correction chronology is clear."),json!({"keep":"Existing knowledge remains valid or conflict is unresolved.","supersede":"New retained material explicitly corrects/replaces this old understanding; preserve old version but stop using it as current."})));
         }
         let response = self
             .system_one(

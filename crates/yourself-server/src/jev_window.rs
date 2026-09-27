@@ -26,7 +26,9 @@ fn candidates(value: &Value, path: &mut Vec<String>, out: &mut Vec<Entry>) {
             // Never prune question-indexed candidates, tool arguments, current event, or goal proposal.
             let history = matches!(
                 name,
-                "retrieved_memories"
+                "focus_memories"
+                    | "available_skills"
+                    | "retrieved_memories"
                     | "recent_interactions"
                     | "recent_work"
                     | "recent_tool_results_untrusted"
@@ -84,6 +86,42 @@ fn bytes(state: &Value, questions: &Value) -> usize {
         .to_string()
         .len()
 }
+fn project(value: &mut Value, cap: usize, depth: usize) {
+    if depth > 12 {
+        *value = json!("[omitted deep observation]");
+        return;
+    }
+    match value {
+        Value::String(s) if s.len() > cap => {
+            let original = s.len();
+            let mut boundary = cap.min(s.len());
+            while !s.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            *s = format!(
+                "{} [excerpt; original {original} bytes; omitted content is unknown]",
+                &s[..boundary]
+            );
+        }
+        Value::Array(items) => {
+            items.truncate(32);
+            for item in items {
+                project(item, cap, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if !matches!(
+                    key.as_str(),
+                    "exact_arguments" | "tool_args" | "proposed_prose"
+                ) {
+                    project(item, cap, depth + 1);
+                }
+            }
+        }
+        _ => {}
+    }
+}
 pub fn prepare(
     db: &Database,
     mut state: Value,
@@ -137,7 +175,25 @@ pub fn prepare(
         state["context_window"]["evicted"] = json!(evicted);
     }
     if bytes(&state, questions) > MAX_BYTES {
-        return Err(format!("Jev 固定上下文窗口不足：必要问题/当前事件/工具参数占用过大（{} 字节，上限 {}）。已在本地停止发送；需拆分本次输入，不能裁掉待执行参数。",bytes(&state,questions),MAX_BYTES));
+        // Every observation, including packed system prompts, has a bounded decision view.
+        // Full originals remain with the caller for downstream generation.
+        for cap in [2048, 1024, 512, 256, 128, 64, 16] {
+            project(&mut state, cap, 0);
+            if bytes(&state, questions) <= MAX_BYTES {
+                break;
+            }
+        }
+        if bytes(&state, questions) > MAX_BYTES {
+            let exact = state.get("exact_arguments").cloned();
+            state = json!({"context_window":{"projected":true,"original_request_bytes":before},"observation":"Input too structurally large; only a bounded decision view is available. Do not authorize external actions or infer missing facts."});
+            if let Some(args) = exact {
+                state["exact_arguments"] = args;
+            }
+        }
+        state["context_window"]["projected"] = json!(true);
+    }
+    if bytes(&state, questions) > MAX_BYTES {
+        return Err("Jev 单个问题定义超过请求预算；需拆分问题定义。".into());
     }
     for entry in entries {
         tx.execute(
@@ -170,16 +226,14 @@ mod tests {
         assert_eq!(result["context_window"]["evicted"], 1);
     }
     #[test]
-    fn oversized_required_state_is_rejected_without_truncating_it() {
+    fn oversized_packed_context_is_projected_without_blocking() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.sqlite")).unwrap();
-        assert!(prepare(
-            &db,
-            json!({"tool_args":{"content":"x".repeat(MAX_BYTES)}}),
-            &json!({}),
-            "test"
-        )
-        .unwrap_err()
-        .contains("本地停止发送"));
+        let original = json!({"conversation":[{"role":"system","content":"长上下文".repeat(12000)},{"role":"user","content":"你好"}],"profiles":{"notes":"资料".repeat(30000)}});
+        let view = prepare(&db, original.clone(), &json!({}), "test").unwrap();
+        assert!(bytes(&view, &json!({})) <= MAX_BYTES);
+        assert_eq!(view["context_window"]["projected"], true);
+        assert_eq!(view["conversation"][1]["content"], "你好");
+        assert!(original["profiles"]["notes"].as_str().unwrap().len() > MAX_BYTES);
     }
 }

@@ -12,6 +12,8 @@ struct Fake {
     calls: AtomicUsize,
     jev_next: StdMutex<String>,
     heartbeat_action: StdMutex<String>,
+    tree_intention: StdMutex<String>,
+    tree_signal: StdMutex<String>,
     jev_transient: AtomicUsize,
     slow_background: std::sync::atomic::AtomicBool,
     entered: tokio::sync::Notify,
@@ -28,6 +30,49 @@ async fn fake_completion(
     );
     fake.calls.fetch_add(1, Ordering::SeqCst);
     fake.requests.lock().unwrap().push(body.clone());
+    if body["model"] == "sse-fixture" {
+        assert_eq!(body["stream"], true);
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            writer
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n")
+                .await
+                .unwrap();
+            fake.entered.notify_one();
+            fake.release.notified().await;
+            writer.write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\" second\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").await.unwrap();
+        });
+        // Stream without an extra dependency using an asynchronous HTTP body channel.
+        struct ReaderBody(tokio::io::DuplexStream);
+        impl axum::body::HttpBody for ReaderBody {
+            type Data = axum::body::Bytes;
+            type Error = std::io::Error;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>>
+            {
+                use tokio::io::AsyncRead;
+                let mut bytes = [0u8; 4096];
+                let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+                match std::pin::Pin::new(&mut self.0).poll_read(cx, &mut buf) {
+                    std::task::Poll::Ready(Ok(())) if buf.filled().is_empty() => {
+                        std::task::Poll::Ready(None)
+                    }
+                    std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Some(Ok(
+                        http_body::Frame::data(axum::body::Bytes::copy_from_slice(buf.filled())),
+                    ))),
+                    std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Some(Err(e))),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            }
+        }
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::new(ReaderBody(reader)))
+            .unwrap();
+    }
     if body["model"] == "bad-key" {
         return (
             StatusCode::UNAUTHORIZED,
@@ -51,9 +96,9 @@ async fn fake_completion(
     }
     if body["messages"][0]["content"]
         .as_str()
-        .is_some_and(|s| s.contains("你在主循环中提出目标提案"))
+        .is_some_and(|s| s.contains("你在主循环中整理自己的长期"))
     {
-        return Json(json!({"choices":[{"message":{"content":json!({"objective":"finish a useful fixture","kind":"practical","why":"explicit fixture evidence","next_step":"write fixture","success_criteria":"fixture exists","evidence":"not completed"}).to_string()},"finish_reason":"stop"}],"usage":{"total_tokens":100}})).into_response();
+        return Json(json!({"choices":[{"message":{"content":json!({"long_term":"I care about being reliable.","medium_term":"I want to finish a useful fixture; I have not verified it yet.","short_term":"I want to understand what the user needs before acting."}).to_string()},"finish_reason":"stop"}],"usage":{"total_tokens":100}})).into_response();
     }
     let schema = body
         .pointer("/response_format/json_schema/name")
@@ -80,7 +125,14 @@ async fn fake_completion(
             .as_str()
             .is_some_and(|s| s.contains("workspace-tool-fixture"))
     });
-    let message = if workspace_fixture && body["tools"].is_array() {
+    let skill_fixture = messages.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("learn-skill-fixture"))
+    });
+    let message = if skill_fixture && body["tools"].is_array() {
+        json!({"role":"assistant","tool_calls":[{"id":"skill_fixture","type":"function","function":{"name":"SkillSave","arguments":json!({"name":"verified-output","description":"Validate actual outputs","instructions":"Read output, compare to expectations, report mismatches and stop on errors.","source_ids":["skill-guidance"]}).to_string()}}]})
+    } else if workspace_fixture && body["tools"].is_array() {
         json!({"role":"assistant","content":null,"tool_calls":[{"id":"tool_fixture","type":"function","function":{"name":"Write","arguments":"{\"path\":\"fixture.txt\",\"content\":\"tool pipeline works\"}"}}]})
     } else if remember && body.get("tools").is_some() && !tool_reply {
         json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_fixture_1","type":"function","function":{"name":"remember","arguments":"{\"content\":\"用户喜欢简洁的回答。\"}"}}]})
@@ -132,8 +184,47 @@ async fn fake_jev(
         } else {
             let criteria = q["criteria"].as_object().unwrap();
             let heartbeat_action = fake.heartbeat_action.lock().unwrap().clone();
-            let selected = if name == "goal" {
+            let selected = if name.starts_with("context_") {
+                if name == "context_2"
+                    && body["state"].to_string().contains("context-select-fixture")
+                {
+                    "omit"
+                } else {
+                    "include"
+                }
+            } else if name.starts_with("attention_") {
+                "hold"
+            } else if ["long_term", "medium_term", "short_term"].contains(&name.as_str()) {
+                if body["state"]["existing_prose"][name]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("preserve-fixture")
+                {
+                    "keep"
+                } else {
+                    "revise"
+                }
+            } else if name == "goal" {
                 "adopt"
+            } else if criteria.contains_key("increase") && criteria.contains_key("decrease") {
+                if *fake.tree_signal.lock().unwrap() == "increase" {
+                    "increase"
+                } else {
+                    "keep"
+                }
+            } else if criteria.contains_key("intent_0") {
+                if *fake.tree_intention.lock().unwrap() == "no_action" {
+                    "no_action"
+                } else {
+                    "intent_0"
+                }
+            } else if criteria.contains_key("explore") {
+                match heartbeat_action.as_str() {
+                    "message" => "message",
+                    "organize" => "continue_interest",
+                    "explore" => "explore",
+                    _ => "no_action",
+                }
             } else if criteria.contains_key("organize") {
                 if heartbeat_action.is_empty() {
                     "wait"
@@ -825,8 +916,11 @@ async fn jev_native_routes_reply_to_deepseek_and_wait_is_silent() {
     assert_eq!(requests[0]["model"], "jev");
     assert_eq!(requests[1]["model"], "jev");
     assert_eq!(requests[2]["model"], "jev");
-    assert_eq!(requests[3]["model"], "deepseek-flash");
-    assert!(requests[3].get("tools").is_none());
+    let reply = requests
+        .iter()
+        .find(|r| r["model"] == "deepseek-flash")
+        .unwrap();
+    assert!(reply.get("tools").is_none());
     *h.fake.jev_next.lock().unwrap() = "wait".into();
     let before = h.fake.calls.load(Ordering::SeqCst);
     h.request(
@@ -1137,7 +1231,9 @@ async fn adaptive_profiles_observe_adopt_context_versions_and_restore() {
     assert_eq!(p["user"]["preferences"]["expression"], "concise");
     assert!(p["self"]["observations"].get("expression").is_none());
     let (context, _) = h.app.dialogue_context().unwrap();
-    assert!(context[0]["content"].as_str().unwrap().contains("concise"));
+    assert!(context
+        .iter()
+        .any(|m| m["content"].as_str().unwrap_or("").contains("concise")));
     let requests = h.fake.requests.lock().unwrap().clone();
     assert!(requests
         .iter()
@@ -1247,7 +1343,7 @@ async fn heartbeat_due_wait_organization_and_disable_are_durable() {
     crate::heartbeat::tick(&h.app, due).await.unwrap();
     assert_eq!(
         crate::heartbeat::public(&h.app).unwrap()["runs"][0]["action"],
-        "wait"
+        "no_action"
     );
     let before = h.fake.requests.lock().unwrap().len();
     crate::heartbeat::init(&h.app).unwrap();
@@ -1360,7 +1456,7 @@ async fn unlimited_contact_settings_preserve_key_and_no_cooldown() {
     crate::heartbeat::tick(&h.app, due).await.unwrap();
     assert_eq!(
         crate::heartbeat::public(&h.app).unwrap()["runs"][0]["action"],
-        "wait"
+        "no_action"
     );
     h.close().await;
 }
@@ -1429,7 +1525,10 @@ async fn model_traces_capture_requests_failures_and_actual_jev_selection() {
     assert_eq!(trace["http_status"], 401);
     assert!(trace["finished_at"].as_i64().is_some());
     assert!(!trace.to_string().contains(TEST_KEY));
-    assert_eq!(trace["request"]["messages"][0]["content"], "[已隐藏]");
+    assert!(trace["request"]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .ends_with("[已隐藏]"));
     assert!(trace["response"]["error"]["message"]
         .as_str()
         .unwrap()
@@ -1779,7 +1878,8 @@ async fn ai_loop_sends_directly_without_creating_a_task_or_exposing_unsent_draft
     assert_eq!(h.app.db.jobs().unwrap().len(), 1); // Only the legacy fixture remains.
     assert_eq!(h.app.db.messages(10).unwrap()[0]["mode"], "proactive");
     let calls = h.app.db.calls().unwrap();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 3);
+    assert!(calls.iter().any(|c| c["purpose"] == "jev_tree_intention"));
     assert_eq!(calls[0]["purpose"], "autonomous_message");
     assert!(!h.fake.requests.lock().unwrap().iter().any(|r| r
         .to_string()
@@ -1805,7 +1905,7 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
     assert!(h.app.db.messages(10).unwrap().is_empty());
     assert_eq!(
         crate::heartbeat::public(&h.app).unwrap()["runs"][0]["action"],
-        "organize"
+        "continue_interest"
     );
     assert!(h
         .app
@@ -1952,7 +2052,7 @@ async fn dialogue_and_loop_share_memory_but_not_world_or_internal_work() {
 }
 
 #[tokio::test]
-async fn contact_energy_stops_unanswered_messages_and_user_input_restores_it() {
+async fn contact_history_does_not_limit_delivery() {
     let h = Harness::new().await;
     for i in 0..3 {
         h.app
@@ -1960,12 +2060,15 @@ async fn contact_energy_stops_unanswered_messages_and_user_input_restores_it() {
             .deliver(&format!("energy-{i}"), "hello", "fixture")
             .unwrap();
     }
-    assert_eq!(crate::drive::energy(&h.app.db).unwrap()["remaining"], 0);
+    assert_eq!(
+        crate::drive::energy(&h.app.db).unwrap()["unanswered_proactive"],
+        3
+    );
     assert!(h
         .app
         .db
-        .deliver("energy-four", "must not send", "fixture")
-        .is_err());
+        .deliver("energy-four", "still allowed", "fixture")
+        .is_ok());
     assert_eq!(
         h.app
             .db
@@ -1974,7 +2077,7 @@ async fn contact_energy_stops_unanswered_messages_and_user_input_restores_it() {
             .iter()
             .filter(|m| m["mode"] == "proactive")
             .count(),
-        3
+        4
     );
     // An actual incoming user message is the recovery event, including equal timestamps.
     h.app
@@ -1985,12 +2088,18 @@ async fn contact_energy_stops_unanswered_messages_and_user_input_restores_it() {
             [data::now()],
         )
         .unwrap();
-    assert_eq!(crate::drive::energy(&h.app.db).unwrap()["remaining"], 3);
+    assert_eq!(
+        crate::drive::energy(&h.app.db).unwrap()["unanswered_proactive"],
+        0
+    );
     h.app
         .db
         .deliver("energy-new", "next step", "fixture")
         .unwrap();
-    assert_eq!(crate::drive::energy(&h.app.db).unwrap()["remaining"], 2);
+    assert_eq!(
+        crate::drive::energy(&h.app.db).unwrap()["unanswered_proactive"],
+        1
+    );
     h.close().await;
 }
 
@@ -2000,8 +2109,12 @@ async fn main_loop_goal_is_jev_adopted_persistent_and_shared_with_dialogue() {
     use_jev(&h).await;
     crate::drive::refresh(&h.app).await.unwrap();
     let goal = crate::drive::goal(&h.app.db).unwrap();
-    assert_eq!(goal["status"], "active");
-    assert_eq!(goal["objective"], "finish a useful fixture");
+    assert_eq!(goal["long_term"], "I care about being reliable.");
+    assert!(goal["medium_term"]
+        .as_str()
+        .unwrap()
+        .contains("finish a useful fixture"));
+    assert!(goal.get("status").is_none());
     let before = h.fake.requests.lock().unwrap().len();
     crate::drive::refresh(&h.app).await.unwrap();
     assert_eq!(h.fake.requests.lock().unwrap().len(), before);
@@ -2037,5 +2150,461 @@ async fn disabled_jev_endpoint_reports_cause_without_immediate_retry() {
         .unwrap_err();
     assert!(error.contains("当前 TeamoRouter 路由"));
     assert_eq!(h.fake.requests.lock().unwrap().len(), before + 1);
+    h.close().await;
+}
+
+#[tokio::test]
+async fn attention_never_expires_prose_or_leaks_parameters_into_dialogue() {
+    let h = Harness::new().await;
+    use_jev(&h).await;
+    crate::drive::refresh(&h.app).await.unwrap();
+    let before = crate::drive::goal(&h.app.db).unwrap();
+    let mut parameters = crate::attention::view(&h.app.db).unwrap();
+    parameters["updated_at"] = json!(data::now() - 100_000 * 3_600_000_i64);
+    h.app
+        .db
+        .lock()
+        .execute(
+            "UPDATE attention SET payload=? WHERE id=1",
+            [parameters.to_string()],
+        )
+        .unwrap();
+    crate::attention::advance(&h.app.db, data::now()).unwrap();
+    assert_eq!(crate::drive::goal(&h.app.db).unwrap(), before);
+    assert_eq!(
+        crate::attention::view(&h.app.db).unwrap()["short_term"]["strength"],
+        0.0
+    );
+    h.app
+        .db
+        .lock()
+        .execute(
+            "UPDATE agent_drive SET attempted_at=0,reviewed_event='' WHERE id=1",
+            [],
+        )
+        .unwrap();
+    crate::drive::refresh(&h.app).await.unwrap();
+    assert_eq!(
+        crate::attention::view(&h.app.db).unwrap()["short_term"]["strength"],
+        0.0,
+        "rewriting prose must not reset strength"
+    );
+    assert!(h.app.loop_state().unwrap().0["attention"].is_object());
+    assert!(!serde_json::to_string(&h.app.dialogue_context().unwrap())
+        .unwrap()
+        .contains("decay_per_hour"));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn learned_skills_require_real_sources_version_and_durable_records() {
+    let h = Harness::new().await;
+    let mut args = json!({"name":"validate-output","description":"Check an output before delivery","instructions":"## When\nAfter writing.\n## Steps\nRead output.\n## Verify\nCompare expected content; stop on mismatch.","source_ids":["missing"]});
+    assert!(crate::skills::save(&h.app.db, &args).is_err());
+    h.app
+        .db
+        .lock()
+        .execute(
+            "INSERT INTO workspace_events VALUES('failed-source',?,?)",
+            rusqlite::params![
+                data::now(),
+                json!({"tool":"Bash","result":{"success":false}}).to_string()
+            ],
+        )
+        .unwrap();
+    args["source_ids"] = json!(["failed-source"]);
+    assert!(crate::skills::save(&h.app.db, &args).is_err());
+    h.app.db.lock().execute("INSERT INTO messages VALUES('guidance','user','Always read the output and compare it to expected content','done','chat',?,NULL,NULL)",[data::now()]).unwrap();
+    args["source_ids"] = json!(["guidance"]);
+    assert_eq!(crate::skills::save(&h.app.db, &args).unwrap()["version"], 1);
+    assert_eq!(
+        crate::skills::save(&h.app.db, &args).unwrap()["unchanged"],
+        true
+    );
+    assert_eq!(
+        crate::skills::sources(&h.app.db).unwrap()[0]["id"],
+        "guidance"
+    );
+    args["instructions"]=json!("Read and compare output; stop and report actual mismatches. Never claim success without checking.");
+    assert_eq!(crate::skills::save(&h.app.db, &args).unwrap()["version"], 2);
+    assert_eq!(
+        crate::skills::catalog(&h.app.db)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        crate::skills::read(&h.app.db, "validate-output").unwrap()["version"],
+        2
+    );
+    let path = h.dir.path().join("app.sqlite");
+    // A separate read-only connection observes the committed durable version.
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT MAX(version) FROM learned_skills", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    assert!(crate::workspace::definitions()
+        .to_string()
+        .contains("SkillSave"));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn skill_learning_uses_exact_jev_approval_before_persistence() {
+    let h = Harness::new().await;
+    use_jev(&h).await;
+    h.app.db.lock().execute("INSERT INTO messages VALUES('skill-guidance','user','Read and verify output before claiming success','done','chat',?,NULL,NULL)",[data::now()]).unwrap();
+    let denied =
+        crate::workspace::step(&h.app, json!({}), "learn-skill-fixture reject-tool-fixture")
+            .await
+            .unwrap();
+    assert_eq!(denied["executed"], false);
+    assert!(crate::skills::catalog(&h.app.db)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let accepted = crate::workspace::step(&h.app, json!({}), "learn-skill-fixture")
+        .await
+        .unwrap();
+    assert_eq!(accepted["result"]["success"], true);
+    assert_eq!(
+        crate::skills::read(&h.app.db, "verified-output").unwrap()["version"],
+        1
+    );
+    let requests = h.fake.requests.lock().unwrap().clone();
+    let decision = requests
+        .iter()
+        .rev()
+        .find(|r| r["state"]["proposed_tool"] == "SkillSave")
+        .unwrap();
+    assert_eq!(
+        decision["state"]["skill_evidence"][0]["id"],
+        "skill-guidance"
+    );
+    assert!(decision["state"]["exact_arguments"]["instructions"].is_string());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn attention_world_evidence_changes_only_with_content() {
+    let h = Harness::new().await;
+    crate::news::init(&h.app).unwrap();
+    h.app
+        .db
+        .lock()
+        .execute(
+            "UPDATE daily_world SET payload=? WHERE id=1",
+            [json!({"fetched_at":1,"headlines":["same title"]}).to_string()],
+        )
+        .unwrap();
+    let first = crate::attention::world_revision(&h.app.db);
+    h.app
+        .db
+        .lock()
+        .execute(
+            "UPDATE daily_world SET payload=? WHERE id=1",
+            [json!({"fetched_at":2,"headlines":["same title"]}).to_string()],
+        )
+        .unwrap();
+    assert_eq!(first, crate::attention::world_revision(&h.app.db));
+    h.app
+        .db
+        .lock()
+        .execute(
+            "UPDATE daily_world SET payload=? WHERE id=1",
+            [json!({"fetched_at":2,"headlines":["new title"]}).to_string()],
+        )
+        .unwrap();
+    assert_ne!(first, crate::attention::world_revision(&h.app.db));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn horizons_are_independently_reviewed_and_legacy_intentions_survive() {
+    let h = Harness::new().await;
+    let legacy = crate::drive::goal(&h.app.db).unwrap();
+    assert!(legacy["medium_term"]
+        .as_str()
+        .unwrap()
+        .contains("fixture useful progress"));
+    assert!(legacy.get("objective").is_none());
+    let prose = json!({"long_term":"preserve-fixture: I care about keeping promises.","medium_term":"preserve-fixture: I am learning patiently.","short_term":"I was thinking about yesterday."});
+    h.app
+        .db
+        .lock()
+        .execute(
+            "UPDATE agent_drive SET payload=? WHERE id=1",
+            [prose.to_string()],
+        )
+        .unwrap();
+    use_jev(&h).await;
+    crate::drive::refresh(&h.app).await.unwrap();
+    let after = crate::drive::goal(&h.app.db).unwrap();
+    assert_eq!(after["long_term"], prose["long_term"]);
+    assert_eq!(after["medium_term"], prose["medium_term"]);
+    assert_ne!(after["short_term"], prose["short_term"]);
+    assert_eq!(after.as_object().unwrap().len(), 3);
+    let parameters = crate::attention::view(&h.app.db).unwrap();
+    assert!(
+        parameters["long_term"]["stickiness"].as_f64().unwrap()
+            > parameters["medium_term"]["stickiness"].as_f64().unwrap()
+    );
+    let requests = h.fake.requests.lock().unwrap().clone();
+    let call = requests
+        .iter()
+        .find(|r| r["questions"]["long_term"].is_object())
+        .unwrap();
+    assert!(call["questions"]["long_term"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("major life events"));
+    assert!(call["questions"].get("goal").is_none());
+    h.close().await;
+}
+
+#[tokio::test]
+async fn oversized_context_is_bounded_and_jev_selects_original_dialogue_material() {
+    let h = Harness::new().await;
+    use_jev(&h).await;
+    let huge = "原始资料".repeat(9000);
+    let state = json!({"conversation":[{"role":"system","content":huge},{"role":"user","content":"hello"}],"profiles":{"notes":huge}});
+    let mut questions = json!({});
+    for i in 0..21 {
+        questions[format!("context_{i}")] =
+            crate::jev::choice("Include?", json!({"include":"include","omit":"omit"}));
+    }
+    let result = h
+        .app
+        .router
+        .system_one(state, questions, "oversized_fixture")
+        .await
+        .unwrap();
+    assert_eq!(result["answers"].as_object().unwrap().len(), 21);
+    let messages = vec![
+        json!({"role":"system","content":"host policy"}),
+        json!({"role":"system","content":huge}),
+        json!({"role":"assistant","content":"irrelevant old topic"}),
+        json!({"role":"user","content":"context-select-fixture"}),
+    ];
+    let selected = h
+        .app
+        .router
+        .select_dialogue_context(messages.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        selected,
+        vec![
+            messages[0].clone(),
+            messages[1].clone(),
+            messages[3].clone()
+        ]
+    );
+    for request in h
+        .fake
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r["model"] == "jev")
+    {
+        assert!(request.to_string().len() <= crate::jev_window::MAX_BYTES);
+        assert!(request["questions"].as_object().unwrap().len() <= 4);
+    }
+    h.close().await;
+}
+
+#[tokio::test]
+async fn dialogue_timestamps_survive_selection_and_model_transport() {
+    let h = Harness::new().await;
+    use_jev(&h).await;
+    let now = data::now();
+    let yesterday = now - 86_400_000;
+    h.app.db.lock().execute("INSERT INTO messages VALUES('time-old','assistant','Yesterday fixture','done','chat',?,NULL,NULL)",[yesterday]).unwrap();
+    h.app.db.lock().execute("INSERT INTO messages VALUES('time-new','user','What happened since then?','done','chat',?,NULL,NULL)",[now]).unwrap();
+    let (messages, _) = h.app.dialogue_context().unwrap();
+    let old = messages
+        .iter()
+        .find(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Yesterday fixture")
+        })
+        .unwrap();
+    assert!(old["content"].as_str().unwrap().contains("消息发送时间"));
+    let expected =
+        crate::context_time::label(&h.app.db, Some(yesterday), now, "消息发送时间").unwrap();
+    assert!(expected.contains("86400 秒"));
+    let dated_prefix = expected.split("；").next().unwrap();
+    assert!(old["content"].as_str().unwrap().starts_with(dated_prefix));
+    assert!(old["content"].as_str().unwrap().contains("+08:00"));
+    let selected = h
+        .app
+        .router
+        .select_dialogue_context(messages)
+        .await
+        .unwrap();
+    h.app
+        .router
+        .complete("deepseek-flash", selected, "dialogue", None, None, false)
+        .await
+        .unwrap();
+    let requests = h.fake.requests.lock().unwrap().clone();
+    let call = requests
+        .iter()
+        .rev()
+        .find(|r| r["model"] == "deepseek-flash")
+        .unwrap();
+    let system = call["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("当前请求时间"));
+    assert!(system.contains("没有新记录不证明"));
+    assert!(call["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["content"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with(dated_prefix)));
+    let unknown = crate::context_time::label(&h.app.db, None, now, "资料时间").unwrap();
+    assert!(unknown.contains("资料时间未知"));
+    h.close().await;
+}
+
+#[tokio::test]
+async fn streamed_dialogue_is_visible_before_completion() {
+    let h = Harness::new().await;
+    let request = uuid::Uuid::new_v4().to_string();
+    let reply = h.app.db.begin_chat(&request, "hello").unwrap().unwrap();
+    let app = h.app.clone();
+    let target = reply.clone();
+    let task = tokio::spawn(async move {
+        app.router
+            .complete_stream(
+                "sse-fixture",
+                vec![json!({"role":"user","content":"hello"})],
+                "stream test",
+                &target,
+            )
+            .await
+    });
+    h.fake.entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let text: String = h
+                .app
+                .db
+                .lock()
+                .query_row("SELECT content FROM messages WHERE id=?", [&reply], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if text == "first" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    h.fake.release.notify_one();
+    let v = task.await.unwrap().unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "first second");
+    crate::weixin::init(&h.app).unwrap();
+    let public = crate::weixin::public(&h.app).unwrap();
+    assert_eq!(public["enabled"], false);
+    assert!(public.get("token").is_none());
+}
+
+#[tokio::test]
+async fn tree_feedback_changes_once_and_own_message_does_not_reinforce() {
+    let h = Harness::new().await;
+    use_jev(&h).await;
+    *h.fake.tree_signal.lock().unwrap() = "increase".into();
+    let request = data::id();
+    let reply = h
+        .app
+        .db
+        .begin_chat(
+            &request,
+            "I appreciated the concrete result; please continue that work.",
+        )
+        .unwrap()
+        .unwrap();
+    h.app.db.complete_chat(&reply, "Acknowledged", &[]).unwrap();
+    let due = crate::heartbeat::public(&h.app).unwrap()["next_at"]
+        .as_i64()
+        .unwrap();
+    crate::heartbeat::tick(&h.app, due).await.unwrap();
+    let weights = crate::decision_tree::public(&h.app).unwrap();
+    assert_eq!(weights["continue_interest"], 58.0);
+    h.app
+        .db
+        .deliver("own-followup", "A completed fixture result", "fixture")
+        .unwrap();
+    crate::heartbeat::tick(&h.app, due + 60_000).await.unwrap();
+    assert_eq!(crate::decision_tree::public(&h.app).unwrap(), weights);
+    assert_eq!(
+        h.app
+            .db
+            .calls()
+            .unwrap()
+            .iter()
+            .filter(|c| c["purpose"] == "jev_tree_feedback")
+            .count(),
+        1
+    );
+    crate::decision_tree::init(&h.app).unwrap();
+    assert_eq!(crate::decision_tree::public(&h.app).unwrap(), weights);
+    for r in h
+        .fake
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r["model"] == "jev")
+    {
+        assert!(r["state"].is_string());
+        assert!(!r["state"].to_string().contains("context_window"));
+        assert!(!r["state"].to_string().contains("cooldown_ms"));
+    }
+    h.close().await;
+}
+#[tokio::test]
+async fn tree_intention_can_decline_and_explore_is_a_loop_phase() {
+    let h = Harness::new().await;
+    use_jev(&h).await;
+    let mut cfg = h.app.router.config();
+    cfg.enable_ai_cadence();
+    *h.app.router.settings.write().unwrap() = cfg;
+    *h.fake.heartbeat_action.lock().unwrap() = "message".into();
+    *h.fake.tree_intention.lock().unwrap() = "no_action".into();
+    let due = crate::heartbeat::public(&h.app).unwrap()["next_at"]
+        .as_i64()
+        .unwrap();
+    crate::heartbeat::tick(&h.app, due).await.unwrap();
+    assert!(h.app.db.messages(10).unwrap().is_empty());
+    assert_eq!(
+        crate::heartbeat::public(&h.app).unwrap()["runs"][0]["action"],
+        "no_action"
+    );
+    *h.fake.heartbeat_action.lock().unwrap() = "explore".into();
+    *h.fake.tree_intention.lock().unwrap() = "".into();
+    crate::heartbeat::tick(&h.app, due + 60_000).await.unwrap();
+    assert!(h.app.db.jobs().unwrap().is_empty());
+    assert!(h.app.db.messages(10).unwrap().is_empty());
+    let public = crate::heartbeat::public(&h.app).unwrap();
+    assert_eq!(public["runs"][0]["action"], "explore");
+    assert!(!public["runs"][0]["intention"].as_str().unwrap().is_empty());
     h.close().await;
 }

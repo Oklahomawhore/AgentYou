@@ -78,6 +78,30 @@ impl OpenRouter {
         tools: Option<Value>,
         web: bool,
     ) -> AppResult<Value> {
+        self.complete_inner(model, messages, purpose, format, tools, web, None)
+            .await
+    }
+    pub async fn complete_stream(
+        &self,
+        model: &str,
+        messages: Vec<Value>,
+        purpose: &str,
+        reply: &str,
+    ) -> AppResult<Value> {
+        self.complete_inner(model, messages, purpose, None, None, true, Some(reply))
+            .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_inner(
+        &self,
+        model: &str,
+        messages: Vec<Value>,
+        purpose: &str,
+        format: Option<Value>,
+        tools: Option<Value>,
+        web: bool,
+        reply: Option<&str>,
+    ) -> AppResult<Value> {
         let config = self.config();
         if config.active_key().is_empty() {
             return Err("请先在设置中填写 模型服务 API Key。".into());
@@ -96,7 +120,12 @@ impl OpenRouter {
             id: call.clone(),
             complete: false,
         };
-        let mut body = json!({"model":model,"messages":messages,"stream":false,"max_tokens":config.max_tokens,"temperature":if format.is_some(){0.2}else{0.7}});
+        let messages =
+            crate::context_time::prepare_messages(&self.db, messages, crate::data::now())?;
+        let mut body = json!({"model":model,"messages":messages,"stream":reply.is_some(),"max_tokens":config.max_tokens,"temperature":if format.is_some(){0.2}else{0.7}});
+        if reply.is_some() {
+            body["stream_options"] = json!({"include_usage":true});
+        }
         if let Some(format) = format {
             body["response_format"] = format;
             if config.provider == Provider::Openrouter {
@@ -137,16 +166,46 @@ impl OpenRouter {
                     }
                 })?;
             let status = response.status();
+            let is_sse = reply.is_some()
+                && status.is_success()
+                && response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("text/event-stream"));
+            let mut decoder = crate::streaming::Decoder::default();
+            let mut received = 0usize;
             let mut bytes = Vec::new();
             while let Some(chunk) = response
                 .chunk()
                 .await
                 .map_err(|_| "模型服务 响应中断。".to_string())?
             {
-                if bytes.len() + chunk.len() > 2_000_000 {
+                received += chunk.len();
+                if received > 2_000_000 {
                     return Err("模型服务 响应超过大小限制。".into());
                 }
-                bytes.extend_from_slice(&chunk);
+                if is_sse {
+                    decoder.feed(&chunk)?;
+                    if !decoder.text.trim().is_empty() {
+                        let changed = self
+                            .db
+                            .lock()
+                            .execute(
+                                "UPDATE messages SET content=? WHERE id=? AND status='pending'",
+                                rusqlite::params![decoder.text, reply.unwrap()],
+                            )
+                            .map_err(|e| e.to_string())?;
+                        if changed == 0 {
+                            return Err("回复已取消，已停止接收。".into());
+                        }
+                    }
+                } else {
+                    bytes.extend_from_slice(&chunk);
+                }
+            }
+            if is_sse {
+                bytes = serde_json::to_vec(&decoder.finish()?).map_err(|e| e.to_string())?;
             }
             self.db.trace_response(
                 &call,
@@ -206,6 +265,70 @@ impl OpenRouter {
         result
     }
     pub async fn system_one(
+        &self,
+        state: Value,
+        questions: Value,
+        purpose: &str,
+    ) -> AppResult<Value> {
+        let mut state = state;
+        if state.is_object() {
+            state["current_time"] = json!(crate::context_time::label(
+                &self.db,
+                Some(crate::data::now()),
+                crate::data::now(),
+                "当前判定时间"
+            )?);
+        }
+        let entries = questions
+            .as_object()
+            .ok_or("Jev questions must be an object")?;
+        let mut merged = json!({"answers":{}});
+        // Fixed-size batches prevent the question catalogue itself exhausting the window.
+        for batch in entries.iter().collect::<Vec<_>>().chunks(4) {
+            let q: Value = Value::Object(
+                batch
+                    .iter()
+                    .map(|(k, v)| ((*k).clone(), (*v).clone()))
+                    .collect(),
+            );
+            let mut input = state.clone();
+            if purpose == "jev_memory" {
+                let revisions = q
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .any(|k| k.starts_with("revision_"));
+                for (field, prefix) in [("fragments", "m"), ("existing", "revision_")] {
+                    if field == "fragments" && revisions {
+                        continue;
+                    }
+                    if field == "existing" && !revisions {
+                        continue;
+                    }
+                    if let Some(items) = input[field].as_array_mut() {
+                        for (index, item) in items.iter_mut().enumerate() {
+                            if !q
+                                .as_object()
+                                .unwrap()
+                                .contains_key(&format!("{prefix}{index}"))
+                            {
+                                *item = Value::Null;
+                            }
+                        }
+                    }
+                }
+            }
+            let result = self.system_one_batch(input, q, purpose).await?;
+            if let Some(answers) = result["answers"].as_object() {
+                merged["answers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(answers.clone());
+            }
+        }
+        Ok(merged)
+    }
+    async fn system_one_batch(
         &self,
         state: Value,
         questions: Value,
