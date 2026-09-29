@@ -879,7 +879,7 @@ async fn run_dialogue(
                 "dialogue",
                 None,
                 allowed_tools.clone(),
-                config.web_search,
+                false, // Browser/WebSearch are the only search path in dialogue.
             )
             .await?;
         let _control = app.control.lock().await;
@@ -1024,9 +1024,10 @@ async fn add_memory(State(app): State<Arc<App>>, Json(input): Json<MemoryInput>)
     .await)
 }
 async fn forget_memory(State(app): State<Arc<App>>, Path(id): Path<String>) -> Response {
+    let _workspace = app.workspace.gate.lock().await;
     let _control = app.control.lock().await;
     let result = async {
-        let removed = app.db.forget_memory(&id)?;
+        let removed = app.db.forget_memory(&id, &app.workspace.root)?;
         app.epoch.fetch_add(1, Ordering::SeqCst);
         let events = removed
             .iter()

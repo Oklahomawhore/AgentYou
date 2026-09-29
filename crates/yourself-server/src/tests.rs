@@ -546,6 +546,41 @@ async fn real_http_contract_chat_tools_and_idempotency() {
     h.close().await;
 }
 #[tokio::test]
+async fn openrouter_dialogue_uses_local_search_without_provider_web_plugin() {
+    let h = Harness::new().await;
+    let mut config = h.app.router.config();
+    config.web_search = true;
+    *h.app.router.settings.write().unwrap() = config;
+    assert_eq!(
+        h.request(
+            "POST",
+            "/api/chat",
+            json!({"text":"查找资料","request_id":data::id()})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    h.wait_chat().await;
+    {
+        let requests = h.fake.requests.lock().unwrap();
+        let dialogue = requests
+            .iter()
+            .find(|body| body["model"] == "openai/gpt-4.1-mini")
+            .unwrap();
+        assert!(dialogue.get("plugins").is_none());
+        let tools = dialogue["tools"].as_array().unwrap();
+        assert!(tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "Browser"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "WebSearch"));
+    }
+    h.close().await;
+}
+
+#[tokio::test]
 async fn no_key_pause_and_budget_block_before_network() {
     let h = Harness::new().await;
     let mut config = h.app.router.config();
@@ -834,7 +869,10 @@ async fn unfinished_erasure_is_recovered_before_runtime_start() {
     run_job(&h.app, &h.app.db.claim_job().unwrap().unwrap())
         .await
         .unwrap();
-    h.app.db.forget_memory(&memory).unwrap();
+    h.app
+        .db
+        .forget_memory(&memory, &h.app.workspace.root)
+        .unwrap();
     assert!(!h.app.db.pending_erasure().unwrap().is_empty());
     let path = h.dir.path().to_path_buf();
     h.app.mind.shutdown().await.unwrap();
@@ -1319,7 +1357,10 @@ async fn adaptive_profiles_observe_adopt_context_versions_and_restore() {
         h.app.db.adaptive_profiles().unwrap()["self"]["preferences"]["expression"],
         "balanced"
     );
-    h.app.db.forget_memory(&original).unwrap();
+    h.app
+        .db
+        .forget_memory(&original, &h.app.workspace.root)
+        .unwrap();
     assert_eq!(
         h.app.db.adaptive_profiles().unwrap()["self"]["version"],
         Value::Null
@@ -1639,7 +1680,7 @@ fn recent_hundred_traces_preserve_accounting_and_erase_context() {
     assert_eq!(db.call_trace(&ids[0]).unwrap()["available"], false);
     assert_eq!(db.call_trace(&ids[104]).unwrap()["available"], true);
     let memory = db.add_memory("user_note", "private", &[]).unwrap();
-    db.forget_memory(&memory).unwrap();
+    db.forget_memory(&memory, dir.path()).unwrap();
     assert_eq!(db.call_trace(&ids[104]).unwrap()["available"], false);
     assert_eq!(db.calls().unwrap().len(), 100);
 }
@@ -1974,7 +2015,16 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
         .unwrap()
         .iter()
         .any(|c| c["purpose"] == "goal_execution"));
-    assert_eq!(crate::execution::list(&h.app).unwrap()[0]["status"], "done");
+    // Linux CI has no workspace OS sandbox, so Read fails closed and the goal blocks.
+    let expected = if cfg!(target_os = "macos") {
+        "done"
+    } else {
+        "blocked"
+    };
+    assert_eq!(
+        crate::execution::list(&h.app).unwrap()[0]["status"],
+        expected
+    );
     h.close().await;
 }
 
@@ -2883,10 +2933,24 @@ async fn goal_dependencies_are_erased_with_source_memory() {
         &guard,
     )
     .unwrap();
-    h.app.db.forget_memory(&source).unwrap();
+    let result_dir = h.app.workspace.root.join(".results");
+    std::fs::create_dir(&result_dir).unwrap();
+    let result_path = result_dir.join(format!("{id}.md"));
+    std::fs::write(&result_path, "private goal source and output").unwrap();
+    h.app.db.lock().execute(
+        "UPDATE execution_goals SET status='done',result_path=?,output='private result' WHERE id=?",
+        rusqlite::params![result_path.to_string_lossy(), id],
+    ).unwrap();
+    h.app
+        .db
+        .forget_memory(&source, &h.app.workspace.root)
+        .unwrap();
+    assert!(!result_path.exists());
     let goals = crate::execution::list(&h.app).unwrap();
     assert_eq!(goals[0]["status"], "cancelled");
     assert_eq!(goals[0]["objective"], "来源已删除");
+    assert!(goals[0]["result_path"].is_null());
+    assert_eq!(goals[0]["output"], "");
     let raw: String = h
         .app
         .db
