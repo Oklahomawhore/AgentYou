@@ -33,7 +33,7 @@ pub(crate) fn selected<'a>(v: &'a Value, options: &[&str]) -> AppResult<&'a str>
     let mut best: Option<(&str, f64)> = None;
     for option in options {
         if let Some((key, value)) = probabilities.get_key_value(*option) {
-            if let Some(score) = value.as_f64().filter(|v| v.is_finite()) {
+            if let Some(score) = value.as_f64().filter(|v| v.is_finite() && *v > 0.0) {
                 if best.is_none_or(|(_, highest)| score > highest) {
                     best = Some((key.as_str(), score));
                 }

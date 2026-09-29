@@ -130,9 +130,43 @@ async fn fake_completion(
             .as_str()
             .is_some_and(|s| s.contains("learn-skill-fixture"))
     });
-    let message = if skill_fixture && body["tools"].is_array() {
+    let loop_fixture = messages.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("code-loop-fixture"))
+    });
+    let tool_count = messages.iter().filter(|m| m["role"] == "tool").count();
+    let goal_definition = messages.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("为已选定任务类型拟定一个具体目标"))
+    });
+    let message = if goal_definition {
+        json!({"role":"assistant","content":json!({"objective":if *fake.heartbeat_action.lock().unwrap()=="organize" {"读取工作空间现状并整理摘要"} else {"主动向用户分享一个简短、有依据的观察"}}).to_string()})
+    } else if loop_fixture && body["tools"].is_array() && tool_count < 3 {
+        let (name, args) = match tool_count {
+            0 => ("Write", json!({"path":"loop.txt","content":"before\n"})),
+            1 => (
+                "Bash",
+                json!({"command":"sed -i '' 's/before/after/' loop.txt"}),
+            ),
+            _ => ("Read", json!({"path":"loop.txt"})),
+        };
+        json!({"role":"assistant","reasoning_content":format!("reasoning-preserve-{tool_count}"),"content":null,"tool_calls":[{"id":format!("loop-{tool_count}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+    } else if loop_fixture && tool_count >= 3 {
+        json!({"role":"assistant","content":"loop.txt 已修改并读取验证为 after。"})
+    } else if !loop_fixture
+        && body["tools"].as_array().is_some_and(|ts| {
+            ts.iter()
+                .any(|t| t["function"]["name"] == "Browser" || t["function"]["name"] == "Read")
+        })
+        && *fake.heartbeat_action.lock().unwrap() == "organize"
+        && !tool_reply
+    {
+        json!({"role":"assistant","tool_calls":[{"id":"inspect","type":"function","function":{"name":"Read","arguments":"{\"path\":\"fixture.txt\"}"}}]})
+    } else if skill_fixture && body["tools"].is_array() {
         json!({"role":"assistant","tool_calls":[{"id":"skill_fixture","type":"function","function":{"name":"SkillSave","arguments":json!({"name":"verified-output","description":"Validate actual outputs","instructions":"Read output, compare to expectations, report mismatches and stop on errors.","source_ids":["skill-guidance"]}).to_string()}}]})
-    } else if workspace_fixture && body["tools"].is_array() {
+    } else if workspace_fixture && body["tools"].is_array() && !tool_reply {
         json!({"role":"assistant","content":null,"tool_calls":[{"id":"tool_fixture","type":"function","function":{"name":"Write","arguments":"{\"path\":\"fixture.txt\",\"content\":\"tool pipeline works\"}"}}]})
     } else if remember && body.get("tools").is_some() && !tool_reply {
         json!({"role":"assistant","content":null,"tool_calls":[{"id":"call_fixture_1","type":"function","function":{"name":"remember","arguments":"{\"content\":\"用户喜欢简洁的回答。\"}"}}]})
@@ -218,6 +252,28 @@ async fn fake_jev(
                 } else {
                     "intent_0"
                 }
+            } else if name == "mode" && criteria.contains_key("communicate") {
+                if body["state"].to_string().contains("code-loop-fixture")
+                    || body["state"]["context"]["latest_user_request"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("workspace-tool-fixture"))
+                {
+                    "code"
+                } else if criteria.contains_key("no_action") {
+                    if *fake.tree_intention.lock().unwrap() == "no_action" {
+                        "no_action"
+                    } else {
+                        match heartbeat_action.as_str() {
+                            "message" => "communicate",
+                            "organize" | "explore" => "explore",
+                            _ => "no_action",
+                        }
+                    }
+                } else {
+                    "communicate"
+                }
+            } else if name == "progress" && criteria.contains_key("complete") {
+                "complete"
             } else if criteria.contains_key("explore") {
                 match heartbeat_action.as_str() {
                     "message" => "message",
@@ -1878,13 +1934,16 @@ async fn ai_loop_sends_directly_without_creating_a_task_or_exposing_unsent_draft
     assert_eq!(h.app.db.jobs().unwrap().len(), 1); // Only the legacy fixture remains.
     assert_eq!(h.app.db.messages(10).unwrap()[0]["mode"], "proactive");
     let calls = h.app.db.calls().unwrap();
-    assert_eq!(calls.len(), 3);
-    assert!(calls.iter().any(|c| c["purpose"] == "jev_tree_intention"));
-    assert_eq!(calls[0]["purpose"], "autonomous_message");
+    assert_eq!(calls.len(), 4);
+    assert!(calls.iter().any(|c| c["purpose"] == "jev_task_mode"));
+    assert!(calls.iter().any(|c| c["purpose"] == "goal_execution"));
     assert!(!h.fake.requests.lock().unwrap().iter().any(|r| r
         .to_string()
         .contains("UNSENT_DRAFT_MUST_NOT_BECOME_CONVERSATION")));
-    assert!(crate::heartbeat::public(&h.app).unwrap()["runs"][0]["job_id"].is_null());
+    assert!(crate::heartbeat::public(&h.app).unwrap()["runs"][0]["job_id"].is_string());
+    let goals = crate::execution::list(&h.app).unwrap();
+    assert_eq!(goals[0]["status"], "done");
+    assert!(std::path::Path::new(goals[0]["result_path"].as_str().unwrap()).is_file());
     assert_eq!(h.app.router.config().public()["primary_channel"], "feishu");
     h.close().await;
 }
@@ -1897,6 +1956,7 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
     c.enable_ai_cadence();
     *h.app.router.settings.write().unwrap() = c;
     *h.fake.heartbeat_action.lock().unwrap() = "organize".into();
+    std::fs::write(h.app.workspace.root.join("fixture.txt"), "真实工作空间观察").unwrap();
     let due = crate::heartbeat::public(&h.app).unwrap()["next_at"]
         .as_i64()
         .unwrap();
@@ -1905,7 +1965,7 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
     assert!(h.app.db.messages(10).unwrap().is_empty());
     assert_eq!(
         crate::heartbeat::public(&h.app).unwrap()["runs"][0]["action"],
-        "continue_interest"
+        "explore"
     );
     assert!(h
         .app
@@ -1913,7 +1973,8 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
         .calls()
         .unwrap()
         .iter()
-        .any(|c| c["purpose"] == "self_organization"));
+        .any(|c| c["purpose"] == "goal_execution"));
+    assert_eq!(crate::execution::list(&h.app).unwrap()[0]["status"], "done");
     h.close().await;
 }
 
@@ -2605,6 +2666,237 @@ async fn tree_intention_can_decline_and_explore_is_a_loop_phase() {
     assert!(h.app.db.messages(10).unwrap().is_empty());
     let public = crate::heartbeat::public(&h.app).unwrap();
     assert_eq!(public["runs"][0]["action"], "explore");
-    assert!(!public["runs"][0]["intention"].as_str().unwrap().is_empty());
+    assert!(public["runs"][0]["job_id"].is_string());
+    assert_eq!(
+        crate::execution::list(&h.app).unwrap()[0]["mode"],
+        "explore"
+    );
+    h.close().await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn durable_code_goal_returns_each_result_preserves_reasoning_and_verifies_sed() {
+    let h = Harness::new().await;
+    use_jev(&h).await;
+    let (status,_)=h.request("POST","/api/chat",json!({"request_id":data::id(),"text":"code-loop-fixture 创建 loop.txt，再用 sed 修改并读取验证"})).await;
+    assert_eq!(status, StatusCode::OK);
+    h.wait_chat().await;
+    let goals = crate::execution::list(&h.app).unwrap();
+    assert_eq!(goals[0]["status"], "done", "{goals:?}");
+    assert_eq!(goals[0]["steps"], 3);
+    assert_eq!(
+        std::fs::read_to_string(h.app.workspace.root.join("loop.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(
+        std::fs::read_to_string(goals[0]["result_path"].as_str().unwrap())
+            .unwrap()
+            .contains("after")
+    );
+    let requests = h.fake.requests.lock().unwrap().clone();
+    let final_request = requests
+        .iter()
+        .find(|r| {
+            r["messages"]
+                .as_array()
+                .is_some_and(|m| m.iter().filter(|x| x["role"] == "tool").count() == 3)
+        })
+        .unwrap();
+    let messages = final_request["messages"].as_array().unwrap();
+    for i in 0..3 {
+        let assistant = messages
+            .iter()
+            .find(|m| m["tool_calls"][0]["id"] == format!("loop-{i}"))
+            .unwrap();
+        assert_eq!(
+            assistant["reasoning_content"],
+            format!("reasoning-preserve-{i}")
+        );
+        let tool = messages
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == format!("loop-{i}"))
+            .unwrap();
+        let result: Value = serde_json::from_str(tool["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["result"]["success"], true);
+    }
+    let last = messages.iter().rev().find(|m| m["role"] == "tool").unwrap();
+    assert!(last["content"].as_str().unwrap().contains("after"));
+    drop(requests);
+    h.close().await;
+}
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn goal_yields_and_resumes_without_repeating_effects() {
+    let h = Harness::new().await;
+    let guard = crate::execution::RunContext::capture(&h.app, false);
+    let id = crate::execution::create(
+        &h.app,
+        crate::execution::TaskMode::Code,
+        "code-loop-fixture",
+        vec![],
+        &[],
+        None,
+        &guard,
+    )
+    .unwrap();
+    assert!(crate::execution::run(&h.app, &id, &guard, 1)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        crate::execution::list(&h.app).unwrap()[0]["status"],
+        "queued"
+    );
+    crate::execution::init(&h.app).unwrap();
+    crate::execution::run(&h.app, &id, &guard, 5).await.unwrap();
+    assert_eq!(crate::execution::list(&h.app).unwrap()[0]["steps"], 3);
+    assert_eq!(
+        std::fs::read_to_string(h.app.workspace.root.join("loop.txt")).unwrap(),
+        "after\n"
+    );
+    h.close().await;
+}
+#[tokio::test]
+async fn task_modes_filter_tools_and_stale_guard_blocks_execution() {
+    let h = Harness::new().await;
+    let code = crate::execution::tools(&h.app, crate::execution::TaskMode::Code);
+    assert!(code.to_string().contains("Bash"));
+    assert!(!code.to_string().contains("WebSearch"));
+    assert_eq!(
+        crate::execution::tools(&h.app, crate::execution::TaskMode::Communicate),
+        json!([])
+    );
+    let explore = crate::execution::tools(&h.app, crate::execution::TaskMode::Explore);
+    assert!(!explore.to_string().contains("Bash"));
+    assert!(!explore.to_string().contains("WebSearch"));
+    let guard = crate::execution::RunContext::capture(&h.app, false);
+    h.app.dialogue_epoch.fetch_add(1, Ordering::SeqCst);
+    let call = json!({"id":"stale","function":{"name":"Write","arguments":"{\"path\":\"stale.txt\",\"content\":\"bad\"}"}});
+    assert!(crate::workspace::execute_call(
+        &h.app,
+        &json!({}),
+        "stale operation",
+        &call,
+        &code,
+        &guard
+    )
+    .await
+    .is_err());
+    assert!(!h.app.workspace.root.join("stale.txt").exists());
+    h.close().await;
+}
+#[test]
+fn jev_invalid_probabilities_cannot_authorize_execution() {
+    for probabilities in [json!({"execute":0,"skip":0}), json!({"execute":-1})] {
+        assert!(crate::jev::selected(
+            &json!({"probabilities":probabilities}),
+            &["execute", "skip"]
+        )
+        .is_err());
+    }
+}
+
+#[tokio::test]
+async fn restart_blocks_uncertain_tool_effects_and_cancellation_is_durable() {
+    let h = Harness::new().await;
+    let guard = crate::execution::RunContext::capture(&h.app, false);
+    let id = crate::execution::create(
+        &h.app,
+        crate::execution::TaskMode::Code,
+        "inspect interrupted work",
+        vec![],
+        &[],
+        None,
+        &guard,
+    )
+    .unwrap();
+    h.app
+        .db
+        .lock()
+        .execute(
+            "UPDATE execution_goals SET status='running' WHERE id=?",
+            [&id],
+        )
+        .unwrap();
+    h.app
+        .db
+        .lock()
+        .execute(
+            "INSERT INTO execution_steps VALUES('uncertain',?,'call','running','{}')",
+            [&id],
+        )
+        .unwrap();
+    crate::execution::init(&h.app).unwrap();
+    assert_eq!(
+        crate::execution::list(&h.app).unwrap()[0]["status"],
+        "blocked"
+    );
+    assert!(crate::execution::run(&h.app, &id, &guard, 2)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(h.fake.requests.lock().unwrap().is_empty());
+    let (status, _) = h
+        .request("POST", &format!("/api/goals/{id}/retry"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let raw: String = h
+        .app
+        .db
+        .lock()
+        .query_row(
+            "SELECT transcript FROM execution_goals WHERE id=?",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(raw.contains("先读取实际工作空间"));
+    assert!(!raw.contains("tool_calls"));
+    let (status, _) = h
+        .request("POST", &format!("/api/goals/{id}/cancel"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        crate::execution::list(&h.app).unwrap()[0]["status"],
+        "cancelled"
+    );
+    h.close().await;
+}
+
+#[tokio::test]
+async fn goal_dependencies_are_erased_with_source_memory() {
+    let h = Harness::new().await;
+    let source = h
+        .app
+        .db
+        .add_memory("user_note", "goal source", &[])
+        .unwrap();
+    let guard = crate::execution::RunContext::capture(&h.app, false);
+    let id = crate::execution::create(
+        &h.app,
+        crate::execution::TaskMode::Code,
+        "private goal source",
+        vec![],
+        std::slice::from_ref(&source),
+        None,
+        &guard,
+    )
+    .unwrap();
+    h.app.db.forget_memory(&source).unwrap();
+    let goals = crate::execution::list(&h.app).unwrap();
+    assert_eq!(goals[0]["status"], "cancelled");
+    assert_eq!(goals[0]["objective"], "来源已删除");
+    let raw: String = h
+        .app
+        .db
+        .lock()
+        .query_row(
+            "SELECT transcript FROM execution_goals WHERE id=?",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, "[]");
     h.close().await;
 }

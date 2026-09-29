@@ -55,6 +55,9 @@ pub fn prepare_messages(
     let clock = label(db, Some(now), now, "当前请求时间")?;
     let instruction="依据明确时间计算间隔，不根据消息条数、语气或叙述长度推测过了几天。记录时间不等于事件发生时间；没有新记录不证明这段时间什么都没发生或文件没被改动。未知时间明确承认未知。";
     for (i, message) in messages.iter_mut().enumerate() {
+        if message["role"] == "tool" || message["role"] == "assistant" {
+            continue;
+        }
         if let Some(text) = message["content"].as_str() {
             let mut content = text.to_owned();
             if !content.starts_with("[上下文时间：") {

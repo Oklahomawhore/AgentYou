@@ -113,7 +113,12 @@ fn project(value: &mut Value, cap: usize, depth: usize) {
             for (key, item) in map.iter_mut() {
                 if !matches!(
                     key.as_str(),
-                    "exact_arguments" | "tool_args" | "proposed_prose"
+                    "exact_arguments"
+                        | "tool_args"
+                        | "proposed_prose"
+                        | "fixed_goal"
+                        | "objective"
+                        | "latest_user_request"
                 ) {
                     project(item, cap, depth + 1);
                 }

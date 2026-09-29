@@ -492,6 +492,11 @@ impl Database {
                     tx.execute("DELETE FROM outbox WHERE message_id=?", [&key])
                         .map_err(err)?;
                 }
+                "goal" => {
+                    tx.execute("UPDATE execution_goals SET status='cancelled',objective='来源已删除',transcript='[]',output='',error='依赖记忆已删除' WHERE id=?",[&key]).map_err(err)?;
+                    tx.execute("DELETE FROM execution_steps WHERE goal_id=?", [&key])
+                        .map_err(err)?;
+                }
                 "job" => {
                     tx.execute("UPDATE jobs SET status='cancelled',objective='来源已删除',output='',error='依赖记忆已删除。' WHERE id=?",[&key]).map_err(err)?;
                 }
