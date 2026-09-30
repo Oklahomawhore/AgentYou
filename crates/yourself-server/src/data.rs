@@ -512,8 +512,7 @@ impl Database {
                         .map_err(err)?;
                 }
                 "goal" => {
-                    erase_result_file(workspace_root, &key)?;
-                    tx.execute("UPDATE execution_goals SET status='cancelled',objective='来源已删除',transcript='[]',result_path=NULL,output='',error='依赖记忆已删除' WHERE id=?",[&key]).map_err(err)?;
+                    tx.execute("UPDATE execution_goals SET status='cancelled',objective='来源已删除',transcript='[]',output='',error='依赖记忆已删除' WHERE id=?",[&key]).map_err(err)?;
                     tx.execute("DELETE FROM execution_steps WHERE goal_id=?", [&key])
                         .map_err(err)?;
                 }

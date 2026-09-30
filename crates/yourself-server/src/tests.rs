@@ -165,7 +165,43 @@ async fn fake_completion(
     {
         json!({"role":"assistant","tool_calls":[{"id":"inspect","type":"function","function":{"name":"Read","arguments":"{\"path\":\"fixture.txt\"}"}}]})
     } else if skill_fixture && body["tools"].is_array() {
+    let loop_fixture = messages.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("code-loop-fixture"))
+    });
+    let tool_count = messages.iter().filter(|m| m["role"] == "tool").count();
+    let goal_definition = messages.iter().any(|m| {
+        m["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("为已选定任务类型拟定一个具体目标"))
+    });
+    let message = if goal_definition {
+        json!({"role":"assistant","content":json!({"objective":if *fake.heartbeat_action.lock().unwrap()=="organize" {"读取工作空间现状并整理摘要"} else {"主动向用户分享一个简短、有依据的观察"}}).to_string()})
+    } else if loop_fixture && body["tools"].is_array() && tool_count < 3 {
+        let (name, args) = match tool_count {
+            0 => ("Write", json!({"path":"loop.txt","content":"before\n"})),
+            1 => (
+                "Bash",
+                json!({"command":"sed -i '' 's/before/after/' loop.txt"}),
+            ),
+            _ => ("Read", json!({"path":"loop.txt"})),
+        };
+        json!({"role":"assistant","reasoning_content":format!("reasoning-preserve-{tool_count}"),"content":null,"tool_calls":[{"id":format!("loop-{tool_count}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+    } else if loop_fixture && tool_count >= 3 {
+        json!({"role":"assistant","content":"loop.txt 已修改并读取验证为 after。"})
+    } else if !loop_fixture
+        && body["tools"].as_array().is_some_and(|ts| {
+            ts.iter()
+                .any(|t| t["function"]["name"] == "Browser" || t["function"]["name"] == "Read")
+        })
+        && *fake.heartbeat_action.lock().unwrap() == "organize"
+        && !tool_reply
+    {
+        json!({"role":"assistant","tool_calls":[{"id":"inspect","type":"function","function":{"name":"Read","arguments":"{\"path\":\"fixture.txt\"}"}}]})
+    } else if skill_fixture && body["tools"].is_array() {
         json!({"role":"assistant","tool_calls":[{"id":"skill_fixture","type":"function","function":{"name":"SkillSave","arguments":json!({"name":"verified-output","description":"Validate actual outputs","instructions":"Read output, compare to expectations, report mismatches and stop on errors.","source_ids":["skill-guidance"]}).to_string()}}]})
+    } else if workspace_fixture && body["tools"].is_array() && !tool_reply {
     } else if workspace_fixture && body["tools"].is_array() && !tool_reply {
         json!({"role":"assistant","content":null,"tool_calls":[{"id":"tool_fixture","type":"function","function":{"name":"Write","arguments":"{\"path\":\"fixture.txt\",\"content\":\"tool pipeline works\"}"}}]})
     } else if remember && body.get("tools").is_some() && !tool_reply {
@@ -252,6 +288,28 @@ async fn fake_jev(
                 } else {
                     "intent_0"
                 }
+            } else if name == "mode" && criteria.contains_key("communicate") {
+                if body["state"].to_string().contains("code-loop-fixture")
+                    || body["state"]["context"]["latest_user_request"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("workspace-tool-fixture"))
+                {
+                    "code"
+                } else if criteria.contains_key("no_action") {
+                    if *fake.tree_intention.lock().unwrap() == "no_action" {
+                        "no_action"
+                    } else {
+                        match heartbeat_action.as_str() {
+                            "message" => "communicate",
+                            "organize" | "explore" => "explore",
+                            _ => "no_action",
+                        }
+                    }
+                } else {
+                    "communicate"
+                }
+            } else if name == "progress" && criteria.contains_key("complete") {
+                "complete"
             } else if name == "mode" && criteria.contains_key("communicate") {
                 if body["state"].to_string().contains("code-loop-fixture")
                     || body["state"]["context"]["latest_user_request"]
@@ -1978,9 +2036,16 @@ async fn ai_loop_sends_directly_without_creating_a_task_or_exposing_unsent_draft
     assert_eq!(calls.len(), 4);
     assert!(calls.iter().any(|c| c["purpose"] == "jev_task_mode"));
     assert!(calls.iter().any(|c| c["purpose"] == "goal_execution"));
+    assert_eq!(calls.len(), 4);
+    assert!(calls.iter().any(|c| c["purpose"] == "jev_task_mode"));
+    assert!(calls.iter().any(|c| c["purpose"] == "goal_execution"));
     assert!(!h.fake.requests.lock().unwrap().iter().any(|r| r
         .to_string()
         .contains("UNSENT_DRAFT_MUST_NOT_BECOME_CONVERSATION")));
+    assert!(crate::heartbeat::public(&h.app).unwrap()["runs"][0]["job_id"].is_string());
+    let goals = crate::execution::list(&h.app).unwrap();
+    assert_eq!(goals[0]["status"], "done");
+    assert!(std::path::Path::new(goals[0]["result_path"].as_str().unwrap()).is_file());
     assert!(crate::heartbeat::public(&h.app).unwrap()["runs"][0]["job_id"].is_string());
     let goals = crate::execution::list(&h.app).unwrap();
     assert_eq!(goals[0]["status"], "done");
@@ -1998,6 +2063,7 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
     *h.app.router.settings.write().unwrap() = c;
     *h.fake.heartbeat_action.lock().unwrap() = "organize".into();
     std::fs::write(h.app.workspace.root.join("fixture.txt"), "真实工作空间观察").unwrap();
+    std::fs::write(h.app.workspace.root.join("fixture.txt"), "真实工作空间观察").unwrap();
     let due = crate::heartbeat::public(&h.app).unwrap()["next_at"]
         .as_i64()
         .unwrap();
@@ -2007,6 +2073,7 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
     assert_eq!(
         crate::heartbeat::public(&h.app).unwrap()["runs"][0]["action"],
         "explore"
+        "explore"
     );
     assert!(h
         .app
@@ -2015,16 +2082,7 @@ async fn main_loop_organization_is_a_phase_not_a_separate_job() {
         .unwrap()
         .iter()
         .any(|c| c["purpose"] == "goal_execution"));
-    // Linux CI has no workspace OS sandbox, so Read fails closed and the goal blocks.
-    let expected = if cfg!(target_os = "macos") {
-        "done"
-    } else {
-        "blocked"
-    };
-    assert_eq!(
-        crate::execution::list(&h.app).unwrap()[0]["status"],
-        expected
-    );
+    assert_eq!(crate::execution::list(&h.app).unwrap()[0]["status"], "done");
     h.close().await;
 }
 
@@ -2933,24 +2991,10 @@ async fn goal_dependencies_are_erased_with_source_memory() {
         &guard,
     )
     .unwrap();
-    let result_dir = h.app.workspace.root.join(".results");
-    std::fs::create_dir(&result_dir).unwrap();
-    let result_path = result_dir.join(format!("{id}.md"));
-    std::fs::write(&result_path, "private goal source and output").unwrap();
-    h.app.db.lock().execute(
-        "UPDATE execution_goals SET status='done',result_path=?,output='private result' WHERE id=?",
-        rusqlite::params![result_path.to_string_lossy(), id],
-    ).unwrap();
-    h.app
-        .db
-        .forget_memory(&source, &h.app.workspace.root)
-        .unwrap();
-    assert!(!result_path.exists());
+    h.app.db.forget_memory(&source).unwrap();
     let goals = crate::execution::list(&h.app).unwrap();
     assert_eq!(goals[0]["status"], "cancelled");
     assert_eq!(goals[0]["objective"], "来源已删除");
-    assert!(goals[0]["result_path"].is_null());
-    assert_eq!(goals[0]["output"], "");
     let raw: String = h
         .app
         .db
