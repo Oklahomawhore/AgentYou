@@ -18,7 +18,7 @@ pub fn catalog(db: &Database) -> AppResult<Value> {
 }
 pub fn sources(db: &Database) -> AppResult<Value> {
     let conn = db.lock();
-    let mut q=conn.prepare("SELECT id,kind,text FROM (SELECT id,'user_guidance' AS kind,content AS text,created_at FROM messages WHERE role='user' AND status='done' UNION ALL SELECT id,'tool_result',payload,created_at FROM workspace_events WHERE json_extract(payload,'$.result.success')=1 AND json_extract(payload,'$.tool') IN ('Read','Write','Bash','Browser')) ORDER BY created_at DESC LIMIT 8").map_err(|e|e.to_string())?;
+    let mut q=conn.prepare("SELECT id,kind,text FROM (SELECT id,'user_guidance' AS kind,content AS text,created_at FROM messages WHERE role='user' AND status='done' UNION ALL SELECT id,'tool_result',payload,created_at FROM workspace_events WHERE json_extract(payload,'$.result.success')=1 AND json_extract(payload,'$.tool') IN ('Read','Write','Bash','Browser','WebSearch')) ORDER BY created_at DESC LIMIT 8").map_err(|e|e.to_string())?;
     let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"kind":r.get::<_,String>(1)?,"excerpt":data::short(&r.get::<_,String>(2)?,400)}))).map_err(|e|e.to_string())?;
     Ok(json!(rows
         .collect::<Result<Vec<_>, _>>()
@@ -71,7 +71,7 @@ pub fn evidence(db: &Database, args: &Value) -> AppResult<Value> {
             if v["result"]["success"] != true
                 || !matches!(
                     v["tool"].as_str(),
-                    Some("Read" | "Write" | "Bash" | "Browser")
+                    Some("Read" | "Write" | "Bash" | "Browser" | "WebSearch")
                 )
             {
                 return Err(

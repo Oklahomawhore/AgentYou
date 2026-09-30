@@ -198,3 +198,7 @@ Jev 模式每轮对话会分别评估 `user`（用户的互动偏好）和 `self
 所有 `/systemone` 调用统一在发送前检查序列化后整份请求的 24 KiB UTF-8 字节上限（不冒充精确 tokenizer 计数）。可淘汰历史项按持久化 LFU 频次排序，同频按最久未访问排序；问题、动作参数和最新两条交互保持完整。必要项本身超限则本地拒绝并提示拆分，原始记忆不删除。请求日志的 `context_window` 包含原始大小、上限和淘汰数量。频次以候选被引用次数计，重试复用同一窗口，不重复增加频次。服务商明确返回 `System One endpoint is disabled` 时如实显示当前路由的响应，不据此认定 Jev 整体停用，也不立即重试。
 
 Jev 实际接口自检：`python3 scripts/check_jev.py --rounds 2`。仅发送公开/合成材料，覆盖文档样例、中文、结构化 state 和三种题型，不重放任何对话或记忆。Key 只读取已有配置用于原服务鉴权，不打印。`--direct` 可对照直连网络；失败报告包含 trace_id。
+
+## 工具循环与 Chromium 搜索（2026-09-27）
+
+本轮将 Jev 的 `communicate / code / explore` 分类接入固定目标执行器，工具结果回传给模型并持久化续跑。无头 Chromium 提供 Browser/WebSearch；详见 [修复说明](docs/TOOL-LOOP-AND-WEB-2026-09-27.zh-CN.md) 和 [修复前代码现状报告](docs/CODE-REVIEW-2026-09-27.zh-CN.md)。

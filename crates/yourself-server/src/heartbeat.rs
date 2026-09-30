@@ -33,6 +33,7 @@ fn err(e: impl std::fmt::Display) -> String {
 }
 pub fn init(app: &App) -> AppResult<()> {
     crate::decision_tree::init(app)?;
+    crate::execution::init(app)?;
     app.db.lock().execute_batch("CREATE TABLE IF NOT EXISTS agent_loop_state(id INTEGER PRIMARY KEY CHECK(id=1),phase TEXT NOT NULL,updated_at INTEGER NOT NULL,last_error TEXT);
         INSERT OR IGNORE INTO agent_loop_state VALUES(1,'idle',0,NULL);
         CREATE TABLE IF NOT EXISTS heartbeat_config(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL,next_at INTEGER NOT NULL);
@@ -69,7 +70,7 @@ pub fn public(app: &App) -> AppResult<Value> {
             r.get(0)
         })
         .map_err(err)?;
-    let mut q=db.prepare("SELECT r.id,r.created_at,r.status,r.action,r.tool,r.job_id,r.error,j.status,p.intention FROM heartbeat_runs r LEFT JOIN jobs j ON j.id=r.job_id LEFT JOIN decision_paths p ON p.run_id=r.id ORDER BY r.created_at DESC LIMIT 20").map_err(err)?;
+    let mut q=db.prepare("SELECT r.id,r.created_at,r.status,r.action,r.tool,r.job_id,r.error,COALESCE(j.status,g.status),COALESCE(p.intention,g.objective) FROM heartbeat_runs r LEFT JOIN jobs j ON j.id=r.job_id LEFT JOIN execution_goals g ON g.id=r.job_id LEFT JOIN decision_paths p ON p.run_id=r.id ORDER BY r.created_at DESC LIMIT 20").map_err(err)?;
     let rows=q.query_map([],|r|Ok(json!({"id":r.get::<_,String>(0)?,"created_at":r.get::<_,i64>(1)?,"status":r.get::<_,String>(2)?,"action":r.get::<_,String>(3)?,"tool":r.get::<_,String>(4)?,"job_id":r.get::<_,Option<String>>(5)?,"error":r.get::<_,Option<String>>(6)?,"job_status":r.get::<_,Option<String>>(7)?,"intention":r.get::<_,Option<String>>(8)?}))).map_err(err)?;
     let phase:Value=db.query_row("SELECT phase,updated_at,last_error FROM agent_loop_state WHERE id=1",[],|r|Ok(json!({"phase":r.get::<_,String>(0)?,"updated_at":r.get::<_,i64>(1)?,"last_error":r.get::<_,Option<String>>(2)?}))).map_err(err)?;
     Ok(
@@ -87,6 +88,7 @@ pub async fn save(State(app): State<Arc<App>>, Json(mut c): Json<Config>) -> Res
     app.db.lock().execute("UPDATE heartbeat_config SET payload=?,next_at=? WHERE id=1",params![serde_json::to_string(&c).map_err(err)?,data::now()+i64::from(c.interval_minutes)*60000]).map_err(err)?;
     // Cancel pending autonomous work on any scope change; newly allowed work must be replanned.
     app.db.lock().execute("UPDATE jobs SET status='cancelled',error='自主循环设置已变化，等待重新判断。' WHERE status IN ('queued','running') AND id IN (SELECT job_id FROM heartbeat_runs WHERE job_id IS NOT NULL)",[]).map_err(err)?;
+    app.db.lock().execute("UPDATE execution_goals SET status='blocked',error='自主循环设置已变更，请检查后继续' WHERE autonomous=1 AND status IN ('queued','running')",[]).map_err(err)?;
     app.epoch.fetch_add(1,Ordering::SeqCst);Ok(json!({"ok":true}))
 }.await)
 }
@@ -139,7 +141,7 @@ pub(crate) async fn tick(app: &Arc<App>, now: i64) -> AppResult<()> {
                 r.get(0)
             })
             .map_err(err)?;
-        let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM heartbeat_runs WHERE status='running') OR EXISTS(SELECT 1 FROM jobs WHERE status='running' OR (status='queued' AND due_at<=?))",[now],|r|r.get(0)).map_err(err)?;
+        let occupied:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM heartbeat_runs WHERE status='running') OR EXISTS(SELECT 1 FROM jobs WHERE status='running' OR (status='queued' AND due_at<=?)) OR EXISTS(SELECT 1 FROM execution_goals WHERE status IN ('queued','running'))",[now],|r|r.get(0)).map_err(err)?;
         if now < due || occupied {
             return Ok(());
         }
@@ -176,6 +178,14 @@ async fn decide(
 ) -> AppResult<()> {
     let (mut context, refs) = app.loop_state()?;
     context["environment"] = crate::environment::snapshot().await;
+    if app.router.config().guards.ai_driven {
+        let guard = crate::execution::RunContext {
+            epoch,
+            dialogue_epoch,
+            autonomous: true,
+        };
+        return crate::execution::autonomous(app, id, context, refs, &guard).await;
+    }
     let (action, intention, selected_context) =
         crate::decision_tree::decide(app, id, &context, &c.public_topics, epoch, dialogue_epoch)
             .await?;
@@ -394,6 +404,12 @@ pub fn start(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 &app,
                 "continuations",
                 import.as_ref().err().map(String::as_str),
+            );
+            let goals = crate::execution::advance(&app).await;
+            phase(
+                &app,
+                "goal_execution",
+                goals.as_ref().err().map(String::as_str),
             );
             let work = crate::service::advance_work(&app).await;
             phase(&app, "decision", work.as_ref().err().map(String::as_str));

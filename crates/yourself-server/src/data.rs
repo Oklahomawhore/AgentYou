@@ -20,6 +20,25 @@ pub fn id() -> String {
 pub fn short(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
+fn erase_result_file(workspace_root: &Path, goal_id: &str) -> AppResult<()> {
+    // Result names are generated UUIDs. Never follow a stored result_path or an
+    // escaped .results directory while handling an erasure request.
+    Uuid::parse_str(goal_id).map_err(err)?;
+    let dir = workspace_root.join(".results");
+    let resolved = match dir.canonicalize() {
+        Ok(path) => path,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(e)),
+    };
+    if !resolved.starts_with(workspace_root) {
+        return Err("结果目录越界".into());
+    }
+    match std::fs::remove_file(dir.join(format!("{goal_id}.md"))) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(err(e)),
+    }
+}
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -439,7 +458,7 @@ impl Database {
         tx.commit().map_err(err)?;
         Ok(key)
     }
-    pub fn forget_memory(&self, key: &str) -> AppResult<Vec<String>> {
+    pub fn forget_memory(&self, key: &str, workspace_root: &Path) -> AppResult<Vec<String>> {
         let mut db = self.lock();
         let tx = db.transaction().map_err(err)?;
         let exists: bool = tx
@@ -490,6 +509,12 @@ impl Database {
                             .map_err(err)?;
                     }
                     tx.execute("DELETE FROM outbox WHERE message_id=?", [&key])
+                        .map_err(err)?;
+                }
+                "goal" => {
+                    erase_result_file(workspace_root, &key)?;
+                    tx.execute("UPDATE execution_goals SET status='cancelled',objective='来源已删除',transcript='[]',result_path=NULL,output='',error='依赖记忆已删除' WHERE id=?",[&key]).map_err(err)?;
+                    tx.execute("DELETE FROM execution_steps WHERE goal_id=?", [&key])
                         .map_err(err)?;
                 }
                 "job" => {
